@@ -12,7 +12,11 @@
 
 namespace urpc
 {
-    enum class MsgType : uint8_t { REQUEST = 0, RESPONSE = 1, ERROR = 2, CANCEL = 3 };
+    enum class MsgType : uint8_t
+    {
+        REQUEST = 0, RESPONSE = 1, ERROR = 2, CANCEL = 3,
+        PING = 4, PONG = 5, GOAWAY = 6
+    };
 
     enum : uint8_t
     {
@@ -101,6 +105,10 @@ namespace urpc
     inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4; // 24
     inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN; // 28
 
+    // лимиты
+    inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024; // meta+body ≤ 16 MiB
+    inline constexpr int MAX_VARINT_SHIFT = 63;
+
     inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
     {
         out.reserve(out.size() + HDR_SIZE);
@@ -150,6 +158,8 @@ namespace urpc
 
         const uint64_t expect = static_cast<uint64_t>(HDR_NO_LEN) + h.meta_len + h.body_len;
         if (h.len != expect) return std::nullopt;
+        if (h.len < HDR_NO_LEN) return std::nullopt;
+        if (h.len > HDR_NO_LEN + MAX_FRAME_NO_LEN) return std::nullopt; // hard cap
         if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
         return h;
     }
@@ -231,12 +241,29 @@ namespace urpc
 
     struct RpcError
     {
-        uint32_t code;
+        uint32_t code{};
         std::string message;
     };
 
     template <class T>
     using RpcExpected = std::variant<T, RpcError>;
+
+    inline UrpcHdr make_ping(uint32_t stream = 0)
+    {
+        UrpcHdr h{};
+        h.type = uint8_t(MsgType::PING);
+        h.stream = stream;
+        return h;
+    }
+
+    inline UrpcHdr make_pong(const UrpcHdr& ping)
+    {
+        UrpcHdr h{};
+        h.type = uint8_t(MsgType::PONG);
+        h.stream = ping.stream;
+        h.flags = ping.flags;
+        return h;
+    }
 } // namespace urpc
 
 #endif // WIRE_H

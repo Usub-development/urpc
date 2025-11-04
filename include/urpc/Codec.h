@@ -14,6 +14,7 @@
 #include <cstring>
 #include <variant>
 #include "ureflect/ureflect_auto.h"
+#include "Wire.h"
 
 namespace urpc
 {
@@ -82,7 +83,7 @@ namespace urpc
             v |= (uint64_t(by & 0x7F) << sh);
             if ((by & 0x80) == 0) break;
             sh += 7;
-            if (sh > 63) return false;
+            if (sh > MAX_VARINT_SHIFT) return false;
         }
         return true;
     }
@@ -112,6 +113,7 @@ namespace urpc
         uint64_t len{};
         if (!get_varu(b, len)) return false;
         if (len > b.remaining()) return false;
+        if (len > MAX_FRAME_NO_LEN) return false; // cap на строку
         out.assign(b.p + b.i, b.p + b.i + static_cast<size_t>(len));
         b.i += static_cast<size_t>(len);
         return true;
@@ -323,7 +325,7 @@ namespace urpc
         return ok;
     }
 
-    // -------- generic via ureflect::tie (без std::tuple_size/std::get) --------
+    // -------- generic via ureflect::tie --------
     template <class T>
     inline void encode(std::string& o, const T& obj)
     {
@@ -340,20 +342,15 @@ namespace urpc
         {
             constexpr auto N = ureflect::count_members<T>;
             auto tie = ureflect::to_tie(const_cast<T&>(obj));
-            [&]<size_t... I>(std::index_sequence<I...>)
-            {
-                (encode(o, ureflect::get<I>(tie)), ...);
-            }(std::make_index_sequence<N>{});
+            [&]<size_t... I>(std::index_sequence<I...>) { (encode(o, ureflect::get<I>(tie)), ...); }(
+                std::make_index_sequence<N>{});
         }
     }
 
     template <class T>
     inline bool decode(Buf& b, T& obj)
     {
-        if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, std::string>)
-        {
-            return dec_prim(b, obj);
-        }
+        if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, std::string>) { return dec_prim(b, obj); }
         else if constexpr (Enum<T>)
         {
             using U = std::underlying_type_t<T>;
@@ -367,10 +364,8 @@ namespace urpc
             constexpr auto N = ureflect::count_members<T>;
             auto tie = ureflect::to_tie(obj);
             bool ok = true;
-            [&]<size_t... I>(std::index_sequence<I...>)
-            {
-                ((ok = ok && decode(b, ureflect::get<I>(tie))), ...);
-            }(std::make_index_sequence<N>{});
+            [&]<size_t... I>(std::index_sequence<I...>) { ((ok = ok && decode(b, ureflect::get<I>(tie))), ...); }(
+                std::make_index_sequence<N>{});
             return ok;
         }
     }

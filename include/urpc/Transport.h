@@ -120,7 +120,8 @@ namespace urpc
         }
 
         const uint32_t len_field = get_le32(fr.rx.data());
-        const size_t total_need = 4 + static_cast<size_t>(len_field); // 4 (len) + (HDR_NO_LEN+payload)
+        if (len_field > MAX_FRAME_NO_LEN + HDR_NO_LEN) co_return std::nullopt;
+        const size_t total_need = 4 + static_cast<size_t>(len_field);
         const size_t now = fr.rx.size();
         if (now < total_need)
         {

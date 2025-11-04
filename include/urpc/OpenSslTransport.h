@@ -113,6 +113,7 @@ namespace urpc
         {
             if (!(co_await this->read_exact_ssl(HDR_SIZE))) co_return std::nullopt;
             const uint32_t len_field = get_le32(this->rx_.data());
+            if (len_field > MAX_FRAME_NO_LEN + HDR_NO_LEN) co_return std::nullopt;
             const size_t total = HDR_SIZE + static_cast<size_t>(len_field);
             if (this->rx_.size() < total)
             {

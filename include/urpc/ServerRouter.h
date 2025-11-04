@@ -144,6 +144,15 @@ namespace urpc
                 << " meta=" << msg.h.meta_len
                 << " body=" << msg.h.body_len << std::endl;
 
+            if (msg.h.type == uint8_t(MsgType::PING))
+            {
+                UrpcHdr pong = make_pong(msg.h);
+                std::string frame = make_frame(pong, {}, {});
+                co_return co_await tr.send_frame(std::move(frame));
+            }
+            if (msg.h.type == uint8_t(MsgType::PONG))
+                co_return true;
+
             if (msg.h.type != static_cast<uint8_t>(MsgType::REQUEST))
                 co_return co_await send_error(tr, msg, 400, "unexpected frame");
 
@@ -168,7 +177,7 @@ namespace urpc
 
             std::string meta;
             std::string body;
-            encode(body, msg);
+            encode(body, RpcError{code, msg});
 
             std::string frame = make_frame(h, std::move(meta), std::move(body));
             std::cout << "[server] send ERROR stream=" << h.stream

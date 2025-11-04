@@ -8,12 +8,14 @@
 #include <utility>
 #include <variant>
 #include <deque>
+
 #include "Wire.h"
 #include "Codec.h"
 #include "Transport.h"
 #include "UrpcSettings.h"
 #include "UrpcSettingsIO.h"
 #include "UrpcSettingsBuilder.h"
+#include "uvent/utils/datastructures/queue/ConcurrentQueues.h"
 
 namespace urpc
 {
@@ -59,10 +61,9 @@ namespace urpc
         usub::uvent::task::Awaitable<std::optional<Resp>>
         unary(uint64_t method, const MetaIn& meta_in, const Req& req, MetaOut* out_meta)
         {
-            if (this->busy_) co_return std::nullopt;
-            this->busy_ = true;
+            if (this->busy_.exchange(true, std::memory_order_acq_rel)) co_return std::nullopt;
 
-            const uint32_t stream = this->next_stream_++;
+            const uint32_t stream = this->next_stream_.fetch_add(1, std::memory_order_relaxed);
 
             std::string meta_bin, body_bin;
             encode(meta_bin, meta_in);
@@ -77,12 +78,12 @@ namespace urpc
             std::string frame = make_frame(h, std::move(meta_bin), std::move(body_bin));
             if (!(co_await this->tr_.send_frame(std::move(frame))))
             {
-                this->busy_ = false;
+                this->busy_.store(false, std::memory_order_release);
                 co_return std::nullopt;
             }
 
             auto pfopt = co_await this->tr_.recv_frame();
-            this->busy_ = false;
+            this->busy_.store(false, std::memory_order_release);
             if (!pfopt) co_return std::nullopt;
 
             const auto& pf = *pfopt;
@@ -104,8 +105,6 @@ namespace urpc
             co_return resp;
         }
 
-        // ------------------ streaming API ------------------
-
         struct Stream
         {
             T* tr{};
@@ -118,7 +117,7 @@ namespace urpc
         usub::uvent::task::Awaitable<std::optional<Stream>>
         stream_open(uint64_t method, uint32_t init_in_credit = 16, uint32_t init_out_credit = 16)
         {
-            const uint32_t stream = this->next_stream_++;
+            const uint32_t stream = this->next_stream_.fetch_add(1, std::memory_order_relaxed);
 
             UrpcHdr h{};
             h.type = uint8_t(MsgType::REQUEST);
@@ -174,9 +173,98 @@ namespace urpc
             co_return co_await s.tr->send_frame(std::move(frame));
         }
 
+        usub::uvent::task::Awaitable<bool> ping()
+        {
+            UrpcHdr h = make_ping(0);
+            h.flags = this->tr_.transport_bits();
+            std::string frame = make_frame(h, {}, {});
+            if (!(co_await this->tr_.send_frame(std::move(frame)))) co_return false;
+            auto pf = co_await this->tr_.recv_frame();
+            if (!pf) co_return false;
+            co_return pf->h.type == uint8_t(MsgType::PONG);
+        }
+
+        usub::uvent::task::Awaitable<bool> cancel(uint32_t stream)
+        {
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::CANCEL);
+            h.flags = this->tr_.transport_bits();
+            h.stream = stream;
+            h.method = 0;
+            std::string frame = make_frame(h, {}, {});
+            co_return co_await this->tr_.send_frame(std::move(frame));
+        }
+
         [[nodiscard]] const std::optional<UrpcSettingsMeta>& peer_settings() const noexcept
         {
             return this->peer_settings_;
+        }
+
+        bool enable_inbox(size_t capacity_pow2 = 1024, bool drop_oldest = true)
+        {
+            if (inbox_) return false;
+            using usub::queue::concurrent::SPSCQueue;
+            inbox_.reset(new SPSCQueue<ParsedFrame>(capacity_pow2));
+            drop_oldest_ = drop_oldest;
+            ovf_count_.store(0, std::memory_order_relaxed);
+            return true;
+        }
+
+        bool try_recv_inbox(ParsedFrame& out)
+        {
+            if (!inbox_) return false;
+            return inbox_->try_dequeue(out);
+        }
+
+        uint64_t inbox_overflow_count() const noexcept
+        {
+            return ovf_count_.load(std::memory_order_relaxed);
+        }
+
+        void stop_inbox() noexcept
+        {
+            inbox_run_.store(false, std::memory_order_release);
+        }
+
+        usub::uvent::task::Awaitable<void> pump_inbox()
+        {
+            if (!inbox_) co_return;
+            if (inbox_run_.exchange(true, std::memory_order_acq_rel)) co_return;
+
+            for (;;)
+            {
+                if (!alive() || !inbox_run_.load(std::memory_order_acquire))
+                    break;
+
+                auto pf = co_await this->tr_.recv_frame();
+                if (!pf) break;
+
+                if (pf->h.type == uint8_t(MsgType::PING))
+                {
+                    UrpcHdr pong = make_pong(pf->h);
+                    std::string frame = make_frame(pong, {}, {});
+                    (void)co_await this->tr_.send_frame(std::move(frame));
+                    continue;
+                }
+
+                if (!inbox_->try_enqueue(std::move(*pf)))
+                {
+                    if (drop_oldest_)
+                    {
+                        ParsedFrame junk;
+                        (void)inbox_->try_dequeue(junk);
+                        if (!inbox_->try_enqueue(std::move(*pf)))
+                            ovf_count_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        ovf_count_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            inbox_run_.store(false, std::memory_order_release);
+            co_return;
         }
 
     private:
@@ -194,9 +282,14 @@ namespace urpc
     private:
         T tr_;
         std::atomic<uint32_t> next_stream_{1};
+        std::atomic<bool> busy_{false};
         bool opened_{false};
-        bool busy_{false};
         std::optional<UrpcSettingsMeta> peer_settings_{};
+
+        std::unique_ptr<usub::queue::concurrent::SPSCQueue<ParsedFrame>> inbox_;
+        std::atomic<bool> inbox_run_{false};
+        std::atomic<uint64_t> ovf_count_{0};
+        bool drop_oldest_{true};
     };
 
     template <RWLike RW>
