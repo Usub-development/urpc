@@ -9,6 +9,8 @@
 #include <array>
 #include <type_traits>
 #include <variant>
+#include <vector>
+#include <utility>
 
 namespace urpc
 {
@@ -62,7 +64,7 @@ namespace urpc
 #pragma pack(push,1)
     struct UrpcHdr
     {
-        uint32_t len; // = HDR_NO_LEN + meta_len + body_len
+        uint32_t len;
         uint8_t ver{1};
         uint8_t type{0};
         uint8_t flags{0};
@@ -102,11 +104,10 @@ namespace urpc
         return v;
     }
 
-    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4; // 24
-    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN; // 28
+    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4;
+    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN;
 
-    // лимиты
-    inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024; // meta+body ≤ 16 MiB
+    inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024;
     inline constexpr int MAX_VARINT_SHIFT = 63;
 
     inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
@@ -159,7 +160,7 @@ namespace urpc
         const uint64_t expect = static_cast<uint64_t>(HDR_NO_LEN) + h.meta_len + h.body_len;
         if (h.len != expect) return std::nullopt;
         if (h.len < HDR_NO_LEN) return std::nullopt;
-        if (h.len > HDR_NO_LEN + MAX_FRAME_NO_LEN) return std::nullopt; // hard cap
+        if (h.len > HDR_NO_LEN + MAX_FRAME_NO_LEN) return std::nullopt;
         if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
         return h;
     }
@@ -181,7 +182,6 @@ namespace urpc
         h.meta_len = static_cast<uint32_t>(meta.size());
         h.body_len = static_cast<uint32_t>(body.size());
         h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
-
         std::string out;
         out.reserve(HDR_SIZE + h.meta_len + h.body_len);
         hdr_encode_into(out, h);
@@ -194,7 +194,6 @@ namespace urpc
     {
         const auto hopt = hdr_decode(p, n);
         if (!hopt) return false;
-
         pf.h = *hopt;
         const size_t meta_off = HDR_SIZE;
         const size_t body_off = HDR_SIZE + pf.h.meta_len;
@@ -243,6 +242,15 @@ namespace urpc
     {
         uint32_t code{};
         std::string message;
+    };
+
+    using MetaKV = std::vector<std::pair<std::string, std::string>>;
+
+    struct Status
+    {
+        uint32_t code{};
+        std::string message;
+        MetaKV trailers;
     };
 
     template <class T>

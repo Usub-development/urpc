@@ -113,7 +113,7 @@ namespace urpc
         uint64_t len{};
         if (!get_varu(b, len)) return false;
         if (len > b.remaining()) return false;
-        if (len > MAX_FRAME_NO_LEN) return false; // cap на строку
+        if (len > MAX_FRAME_NO_LEN) return false;
         out.assign(b.p + b.i, b.p + b.i + static_cast<size_t>(len));
         b.i += static_cast<size_t>(len);
         return true;
@@ -256,6 +256,19 @@ namespace urpc
         return true;
     }
 
+    template <class A, class B>
+    inline void encode(std::string& o, const std::pair<A, B>& p)
+    {
+        encode(o, p.first);
+        encode(o, p.second);
+    }
+
+    template <class A, class B>
+    inline bool decode(Buf& b, std::pair<A, B>& p)
+    {
+        return decode(b, p.first) && decode(b, p.second);
+    }
+
     template <class T>
     inline void encode(std::string& o, const std::optional<T>& v)
     {
@@ -325,7 +338,6 @@ namespace urpc
         return ok;
     }
 
-    // -------- generic via ureflect::tie --------
     template <class T>
     inline void encode(std::string& o, const T& obj)
     {

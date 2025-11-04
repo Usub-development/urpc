@@ -28,14 +28,12 @@ namespace urpc
             auto wrapper = [fn = std::move(fn), id](T& tr, const ParsedFrame& pf)
                 -> usub::uvent::task::Awaitable<bool>
             {
-                if (pf.h.type != static_cast<uint8_t>(MsgType::REQUEST))
-                    co_return false;
+                if (pf.h.type != static_cast<uint8_t>(MsgType::REQUEST)) co_return false;
 
                 Req req{};
                 {
                     Buf bb{pf.body};
-                    if (!decode(bb, req))
-                        co_return co_await send_error(tr, pf, 400, "bad request");
+                    if (!decode(bb, req)) co_return co_await send_error(tr, pf, 400, "bad request");
                 }
 
                 Resp resp = co_await fn(std::move(req));
@@ -51,16 +49,15 @@ namespace urpc
                 h.method = id;
 
                 std::string frame = make_frame(h, std::move(out_meta), std::move(out_body));
-                std::cout << "[server] send RESPONSE stream=" << h.stream
-                    << " method=" << h.method
-                    << " bytes=" << frame.size() << std::endl;
+                std::cout << "[server] send RESPONSE stream=" << h.stream << " method=" << h.method << " bytes=" <<
+                    frame.size() << std::endl;
 
                 bool ok = co_await tr.send_frame(std::move(frame));
                 std::cout << "[server] RESPONSE write=" << ok << std::endl;
                 co_return ok;
             };
 
-            table_[id] = std::move(wrapper);
+            this->table_[id] = std::move(wrapper);
         }
 
         template <class Req, class Resp, class C>
@@ -99,17 +96,15 @@ namespace urpc
                 ack.flags = first->h.flags;
                 ack.stream = SETTINGS_STREAM;
                 ack.method = SETTINGS_METHOD;
-
                 std::string frame = make_frame(ack, {}, {});
                 std::cout << "[server] send SETTINGS-ACK (" << frame.size() << "B)" << std::endl;
                 (void)co_await tr.send_frame(std::move(frame));
-
                 std::cout << "[server] hand over to router" << std::endl;
             }
             else
             {
                 std::cout << "[server] first frame is REQUEST, dispatch immediately" << std::endl;
-                (void)co_await dispatch_one(tr, *first);
+                (void)co_await this->dispatch_one(tr, *first);
             }
 
             for (;;)
@@ -120,7 +115,7 @@ namespace urpc
                     std::cout << "[server] recv_frame: connection closed" << std::endl;
                     co_return;
                 }
-                (void)co_await dispatch_one(tr, *msg);
+                (void)co_await this->dispatch_one(tr, *msg);
             }
         }
 
@@ -130,19 +125,14 @@ namespace urpc
         template <class RWX>
         static T make_transport(RWX rw, TransportMode mode)
         {
-            if constexpr (std::is_same_v<T, RawTransport<RWX>>)
-                return T(std::move(rw));
-            else
-                return T(std::move(rw), mode);
+            if constexpr (std::is_same_v<T, RawTransport<RWX>>) return T(std::move(rw));
+            else return T(std::move(rw), mode);
         }
 
         usub::uvent::task::Awaitable<bool> dispatch_one(T& tr, const ParsedFrame& msg)
         {
-            std::cout << "[server] recv msg: type=" << int(msg.h.type)
-                << " stream=" << msg.h.stream
-                << " method=" << msg.h.method
-                << " meta=" << msg.h.meta_len
-                << " body=" << msg.h.body_len << std::endl;
+            std::cout << "[server] recv msg: type=" << int(msg.h.type) << " stream=" << msg.h.stream << " method=" <<
+                msg.h.method << " meta=" << msg.h.meta_len << " body=" << msg.h.body_len << std::endl;
 
             if (msg.h.type == uint8_t(MsgType::PING))
             {
@@ -150,19 +140,15 @@ namespace urpc
                 std::string frame = make_frame(pong, {}, {});
                 co_return co_await tr.send_frame(std::move(frame));
             }
-            if (msg.h.type == uint8_t(MsgType::PONG))
-                co_return true;
+            if (msg.h.type == uint8_t(MsgType::PONG)) co_return true;
 
-            if (msg.h.type != static_cast<uint8_t>(MsgType::REQUEST))
-                co_return co_await send_error(tr, msg, 400, "unexpected frame");
+            if (msg.h.type != static_cast<uint8_t>(MsgType::REQUEST)) co_return co_await send_error(
+                tr, msg, 400, "unexpected frame");
 
-            auto it = table_.find(msg.h.method);
-            if (it == table_.end())
-                co_return co_await send_error(tr, msg, 404, "unknown method");
+            auto it = this->table_.find(msg.h.method);
+            if (it == this->table_.end()) co_return co_await send_error(tr, msg, 404, "unknown method");
 
-            std::cout << "[server] dispatch method=" << msg.h.method
-                << " stream=" << msg.h.stream << std::endl;
-
+            std::cout << "[server] dispatch method=" << msg.h.method << " stream=" << msg.h.stream << std::endl;
             co_return co_await it->second(tr, msg);
         }
 
@@ -174,17 +160,12 @@ namespace urpc
             h.flags = pf.h.flags;
             h.stream = pf.h.stream;
             h.method = pf.h.method;
-
             std::string meta;
             std::string body;
             encode(body, RpcError{code, msg});
-
             std::string frame = make_frame(h, std::move(meta), std::move(body));
-            std::cout << "[server] send ERROR stream=" << h.stream
-                << " code=" << code
-                << " bytes=" << frame.size()
-                << " msg=" << msg << std::endl;
-
+            std::cout << "[server] send ERROR stream=" << h.stream << " code=" << code << " bytes=" << frame.size() <<
+                " msg=" << msg << std::endl;
             co_return co_await tr.send_frame(std::move(frame));
         }
     };
