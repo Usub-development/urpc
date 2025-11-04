@@ -1,6 +1,3 @@
-//
-// Created by root on 11/4/25.
-//
 #ifndef WIRE_H
 #define WIRE_H
 
@@ -11,6 +8,7 @@
 #include <span>
 #include <array>
 #include <type_traits>
+#include <variant>
 
 namespace urpc
 {
@@ -42,6 +40,7 @@ namespace urpc
         F_COMPRESSED = 1u << 2,
         F_CB_PRESENT = 1u << 3,
         F_STREAM_LAST = 1u << 4,
+        F_FLOW_CREDIT = 1u << 5
     };
 
     inline constexpr uint32_t SETTINGS_STREAM = 0;
@@ -59,8 +58,7 @@ namespace urpc
 #pragma pack(push,1)
     struct UrpcHdr
     {
-        // len = meta_len + body_len   (ВАЖНО: без HDR_NO_LEN)
-        uint32_t len;
+        uint32_t len; // = HDR_NO_LEN + meta_len + body_len
         uint8_t ver{1};
         uint8_t type{0};
         uint8_t flags{0};
@@ -100,13 +98,13 @@ namespace urpc
         return v;
     }
 
-    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4; // = 24
-    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN; // = 28
+    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4; // 24
+    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN; // 28
 
     inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
     {
         out.reserve(out.size() + HDR_SIZE);
-        put_le32(out, h.len); // len = meta_len + body_len
+        put_le32(out, h.len);
         out.push_back(static_cast<char>(h.ver));
         out.push_back(static_cast<char>(h.type));
         out.push_back(static_cast<char>(h.flags));
@@ -125,20 +123,13 @@ namespace urpc
         return out;
     }
 
-    [[nodiscard]] inline std::optional<UrpcHdr>
-    hdr_decode(std::span<const std::byte> buf)
+    [[nodiscard]] inline std::optional<UrpcHdr> hdr_decode(std::span<const std::byte> buf)
     {
         const size_t n = buf.size();
         if (n < HDR_SIZE) return std::nullopt;
 
-        auto u8 = [&](size_t idx)-> uint8_t
-        {
-            return static_cast<uint8_t>(std::to_integer<unsigned char>(buf[idx]));
-        };
-        auto ptr = [&](size_t idx)-> const char*
-        {
-            return reinterpret_cast<const char*>(buf.data() + idx);
-        };
+        auto u8 = [&](size_t idx)-> uint8_t { return static_cast<uint8_t>(std::to_integer<unsigned char>(buf[idx])); };
+        auto ptr = [&](size_t idx)-> const char* { return reinterpret_cast<const char*>(buf.data() + idx); };
 
         size_t i = 0;
         UrpcHdr h{};
@@ -157,15 +148,13 @@ namespace urpc
         h.body_len = get_le32(ptr(i));
         i += 4;
 
-        const uint64_t expect = static_cast<uint64_t>(h.meta_len) + h.body_len;
+        const uint64_t expect = static_cast<uint64_t>(HDR_NO_LEN) + h.meta_len + h.body_len;
         if (h.len != expect) return std::nullopt;
-        if (n < HDR_SIZE + expect) return std::nullopt;
-
+        if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
         return h;
     }
 
-    [[nodiscard]] inline std::optional<UrpcHdr>
-    hdr_decode(const char* p, size_t n)
+    [[nodiscard]] inline std::optional<UrpcHdr> hdr_decode(const char* p, size_t n)
     {
         return hdr_decode(std::span<const std::byte>(reinterpret_cast<const std::byte*>(p), n));
     }
@@ -181,7 +170,7 @@ namespace urpc
     {
         h.meta_len = static_cast<uint32_t>(meta.size());
         h.body_len = static_cast<uint32_t>(body.size());
-        h.len = static_cast<uint32_t>(h.meta_len + h.body_len);
+        h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
 
         std::string out;
         out.reserve(HDR_SIZE + h.meta_len + h.body_len);
@@ -236,6 +225,18 @@ namespace urpc
         if (pf.h.stream != SETTINGS_STREAM || pf.h.method != SETTINGS_METHOD) return false;
         return transport_matches(is_tls, is_mtls, pf.h.flags);
     }
+
+    inline bool is_stream_last(uint8_t flags) { return flags_has(flags, F_STREAM_LAST); }
+    inline bool is_credit_frame(uint8_t flags) { return flags_has(flags, F_FLOW_CREDIT); }
+
+    struct RpcError
+    {
+        uint32_t code;
+        std::string message;
+    };
+
+    template <class T>
+    using RpcExpected = std::variant<T, RpcError>;
 } // namespace urpc
 
 #endif // WIRE_H

@@ -5,6 +5,7 @@
 #include <functional>
 #include <utility>
 #include <iostream>
+
 #include "Wire.h"
 #include "Codec.h"
 #include "Transport.h"
@@ -22,33 +23,20 @@ namespace urpc
         void register_unary(std::string name, Fn fn)
         {
             const uint64_t id = method_id(name);
+            std::cout << "[server] registered '" << name << "' id=" << id << std::endl;
 
             auto wrapper = [fn = std::move(fn), id](T& tr, const ParsedFrame& pf)
                 -> usub::uvent::task::Awaitable<bool>
             {
+                if (pf.h.type != static_cast<uint8_t>(MsgType::REQUEST))
+                    co_return false;
+
                 Req req{};
                 {
                     Buf bb{pf.body};
                     if (!decode(bb, req))
-                    {
-                        std::cout << "[server] decode failed method=" << id
-                            << " stream=" << pf.h.stream << "\n";
-                        UrpcHdr eh{};
-                        eh.type = static_cast<uint8_t>(MsgType::ERROR);
-                        eh.flags = pf.h.flags;
-                        eh.stream = pf.h.stream;
-                        eh.method = pf.h.method;
-
-                        std::string meta, body;
-                        encode(body, std::string("decode failed"));
-                        std::string frame = make_frame(eh, std::move(meta), std::move(body));
-                        (void)co_await tr.send_frame(std::move(frame));
-                        co_return false;
-                    }
+                        co_return co_await send_error(tr, pf, 400, "bad request");
                 }
-
-                std::cout << "[server] dispatch method=" << id
-                    << " stream=" << pf.h.stream << "\n";
 
                 Resp resp = co_await fn(std::move(req));
 
@@ -63,14 +51,16 @@ namespace urpc
                 h.method = id;
 
                 std::string frame = make_frame(h, std::move(out_meta), std::move(out_body));
-                const bool ok = co_await tr.send_frame(std::move(frame));
-                std::cout << "[server] sent RESPONSE stream=" << pf.h.stream
-                    << " ok=" << ok << "\n";
+                std::cout << "[server] send RESPONSE stream=" << h.stream
+                    << " method=" << h.method
+                    << " bytes=" << frame.size() << std::endl;
+
+                bool ok = co_await tr.send_frame(std::move(frame));
+                std::cout << "[server] RESPONSE write=" << ok << std::endl;
                 co_return ok;
             };
 
             table_[id] = std::move(wrapper);
-            std::cout << "[server] registered '" << name << "' id=" << id << "\n";
         }
 
         template <class Req, class Resp, class C>
@@ -98,93 +88,95 @@ namespace urpc
         {
             T tr = make_transport(std::move(rw), mode);
 
+            std::cout << "[server] wait SETTINGS..." << std::endl;
             auto first = co_await tr.recv_frame();
-            if (!first)
-            {
-                std::cout << "[server] connection closed before SETTINGS\n";
-                co_return;
-            }
-
-            std::cout << "[server] got frame: type=" << int(first->h.type)
-                << " stream=" << first->h.stream
-                << " method=" << first->h.method
-                << " meta=" << first->h.meta_len
-                << " body=" << first->h.body_len << "\n";
+            if (!first) co_return;
 
             if (first->h.stream == SETTINGS_STREAM && first->h.method == SETTINGS_METHOD)
             {
-                (void)decode_settings_from(*first);
-                std::string ack = make_frame(make_settings_hdr(mode), {}, {});
-                std::cout << "[server] send SETTINGS-ACK (" << ack.size() << "B)\n";
-                (void)co_await tr.send_frame(std::move(ack));
+                UrpcHdr ack{};
+                ack.type = static_cast<uint8_t>(MsgType::RESPONSE);
+                ack.flags = first->h.flags;
+                ack.stream = SETTINGS_STREAM;
+                ack.method = SETTINGS_METHOD;
+
+                std::string frame = make_frame(ack, {}, {});
+                std::cout << "[server] send SETTINGS-ACK (" << frame.size() << "B)" << std::endl;
+                (void)co_await tr.send_frame(std::move(frame));
+
+                std::cout << "[server] hand over to router" << std::endl;
             }
             else
             {
-                (void)co_await route_one(tr, *first);
+                std::cout << "[server] first frame is REQUEST, dispatch immediately" << std::endl;
+                (void)co_await dispatch_one(tr, *first);
             }
-
-            std::cout << "[server] hand over to router\n";
 
             for (;;)
             {
                 auto msg = co_await tr.recv_frame();
                 if (!msg)
                 {
-                    std::cout << "[server] recv_frame: connection closed\n";
+                    std::cout << "[server] recv_frame: connection closed" << std::endl;
                     co_return;
                 }
-                (void)co_await route_one(tr, *msg);
+                (void)co_await dispatch_one(tr, *msg);
             }
         }
 
     private:
         std::unordered_map<uint64_t, RawHandler> table_;
 
-        usub::uvent::task::Awaitable<bool> route_one(T& tr, const ParsedFrame& msg)
+        template <class RWX>
+        static T make_transport(RWX rw, TransportMode mode)
+        {
+            if constexpr (std::is_same_v<T, RawTransport<RWX>>)
+                return T(std::move(rw));
+            else
+                return T(std::move(rw), mode);
+        }
+
+        usub::uvent::task::Awaitable<bool> dispatch_one(T& tr, const ParsedFrame& msg)
         {
             std::cout << "[server] recv msg: type=" << int(msg.h.type)
                 << " stream=" << msg.h.stream
                 << " method=" << msg.h.method
                 << " meta=" << msg.h.meta_len
-                << " body=" << msg.h.body_len << "\n";
+                << " body=" << msg.h.body_len << std::endl;
 
             if (msg.h.type != static_cast<uint8_t>(MsgType::REQUEST))
-            {
-                std::cout << "[server] non-REQUEST frame, ignore\n";
-                co_return true;
-            }
+                co_return co_await send_error(tr, msg, 400, "unexpected frame");
 
             auto it = table_.find(msg.h.method);
             if (it == table_.end())
-            {
-                UrpcHdr h{};
-                h.type = static_cast<uint8_t>(MsgType::ERROR);
-                h.flags = msg.h.flags;
-                h.stream = msg.h.stream;
-                h.method = msg.h.method;
+                co_return co_await send_error(tr, msg, 404, "unknown method");
 
-                std::string meta, body;
-                encode(body, std::string("unknown method"));
-                std::string frame = make_frame(h, std::move(meta), std::move(body));
-                std::cout << "[server] unknown method id=" << msg.h.method << ", sending ERROR\n";
-                (void)co_await tr.send_frame(std::move(frame));
-                co_return false;
-            }
+            std::cout << "[server] dispatch method=" << msg.h.method
+                << " stream=" << msg.h.stream << std::endl;
 
-            const bool ok = co_await it->second(tr, msg);
-            if (!ok)
-            {
-                std::cout << "[server] handler ok=false method=" << msg.h.method << "\n";
-            }
-            co_return ok;
+            co_return co_await it->second(tr, msg);
         }
 
-        static T make_transport(RWLike auto rw, TransportMode mode)
+        static usub::uvent::task::Awaitable<bool> send_error(T& tr, const ParsedFrame& pf, uint32_t code,
+                                                             std::string msg)
         {
-            if constexpr (std::is_same_v<T, RawTransport<std::decay_t<decltype(rw)>>>)
-                return T(std::move(rw));
-            else
-                return T(std::move(rw), mode);
+            UrpcHdr h{};
+            h.type = static_cast<uint8_t>(MsgType::ERROR);
+            h.flags = pf.h.flags;
+            h.stream = pf.h.stream;
+            h.method = pf.h.method;
+
+            std::string meta;
+            std::string body;
+            encode(body, msg);
+
+            std::string frame = make_frame(h, std::move(meta), std::move(body));
+            std::cout << "[server] send ERROR stream=" << h.stream
+                << " code=" << code
+                << " bytes=" << frame.size()
+                << " msg=" << msg << std::endl;
+
+            co_return co_await tr.send_frame(std::move(frame));
         }
     };
 }
