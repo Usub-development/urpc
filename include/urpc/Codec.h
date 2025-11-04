@@ -17,7 +17,7 @@
 #include "ureflect/ureflect_auto.h"
 
 
-namespace urpcv1
+namespace urpc
 {
     struct Buf
     {
