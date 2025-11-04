@@ -1,7 +1,3 @@
-//
-// Created by root on 11/4/25.
-//
-
 #ifndef CODEC_H
 #define CODEC_H
 
@@ -16,24 +12,29 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <variant>
 #include "ureflect/ureflect_auto.h"
 
 namespace urpc
 {
-    // ============================
-    // Buffer (safe, span-friendly)
-    // ============================
     struct Buf
     {
         const char* p{};
         size_t n{};
         size_t i{};
-
         Buf() = default;
-        Buf(const char* data, size_t size) : p(data), n(size), i(0) {}
-        explicit Buf(std::string_view sv) : p(sv.data()), n(sv.size()), i(0) {}
-        explicit Buf(std::span<const std::byte> s)
-            : p(reinterpret_cast<const char*>(s.data())), n(s.size()), i(0) {}
+
+        Buf(const char* data, size_t size) : p(data), n(size), i(0)
+        {
+        }
+
+        explicit Buf(std::string_view sv) : p(sv.data()), n(sv.size()), i(0)
+        {
+        }
+
+        explicit Buf(std::span<const std::byte> s) : p(reinterpret_cast<const char*>(s.data())), n(s.size()), i(0)
+        {
+        }
 
         [[nodiscard]] size_t remaining() const noexcept { return (i <= n) ? (n - i) : 0; }
 
@@ -60,9 +61,6 @@ namespace urpc
         }
     };
 
-    // ==============
-    // Varint (LEB128)
-    // ==============
     inline void put_varu(std::string& o, uint64_t v)
     {
         while (v >= 0x80)
@@ -91,7 +89,6 @@ namespace urpc
 
     inline void put_vars(std::string& o, int64_t s)
     {
-        // ZigZag
         const uint64_t u = (uint64_t(s) << 1) ^ uint64_t(s >> 63);
         put_varu(o, u);
     }
@@ -120,27 +117,30 @@ namespace urpc
         return true;
     }
 
-    // ==========
-    // FNV-1a 64
-    // ==========
-    constexpr uint64_t FNV_OFFSET = 1469598103934665603ull;
-    constexpr uint64_t FNV_PRIME  = 1099511628211ull;
-
     inline uint64_t fnv1a64_fast(const uint8_t* p, size_t n)
     {
+        constexpr uint64_t FNV_OFFSET = 1469598103934665603ull, FNV_PRIME = 1099511628211ull;
         uint64_t h = FNV_OFFSET;
         while (n >= 8)
         {
             uint64_t v;
             std::memcpy(&v, p, 8);
-            h ^= static_cast<uint8_t>(v >> 0);  h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 8);  h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 16); h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 24); h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 32); h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 40); h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 48); h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 56); h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 0);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 8);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 16);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 24);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 32);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 40);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 48);
+            h *= FNV_PRIME;
+            h ^= static_cast<uint8_t>(v >> 56);
+            h *= FNV_PRIME;
             p += 8;
             n -= 8;
         }
@@ -157,42 +157,38 @@ namespace urpc
         return fnv1a64_fast(reinterpret_cast<const uint8_t*>(s.data()), s.size());
     }
 
-    // ==================
-    // Primitive codecs
-    // ==================
+    template <class T>
+    inline void encode(std::string& o, const T& v);
+    template <class T>
+    inline bool decode(Buf& b, T& v);
+
+    inline void encode(std::string&, const std::monostate&)
+    {
+    }
+
+    inline bool decode(Buf&, std::monostate&) { return true; }
+
     template <class T>
     inline void enc_prim(std::string& o, const T& v)
     {
-        if constexpr (std::is_same_v<T, bool>)
-        {
-            o.push_back(v ? char(1) : char(0));
-        }
-        else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>)
-        {
-            put_vars(o, static_cast<int64_t>(v));
-        }
-        else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>)
-        {
-            put_varu(o, static_cast<uint64_t>(v));
-        }
+        if constexpr (std::is_same_v<T, bool>) { o.push_back(v ? char(1) : char(0)); }
+        else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) { put_vars(o, static_cast<int64_t>(v)); }
+        else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) { put_varu(o, static_cast<uint64_t>(v)); }
         else if constexpr (std::is_same_v<T, float>)
         {
-            const auto bits = std::bit_cast<std::array<char,4>>(v);
+            const auto bits = std::bit_cast<std::array<char, 4>>(v);
             o.append(bits.data(), bits.size());
         }
         else if constexpr (std::is_same_v<T, double>)
         {
-            const auto bits = std::bit_cast<std::array<char,8>>(v);
+            const auto bits = std::bit_cast<std::array<char, 8>>(v);
             o.append(bits.data(), bits.size());
         }
         else if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>)
         {
             put_bytes(o, std::string_view(v));
         }
-        else
-        {
-            static_assert(!sizeof(T*), "enc_prim unsupported type");
-        }
+        else { static_assert(!sizeof(T*), "enc_prim unsupported type"); }
     }
 
     template <class T>
@@ -237,25 +233,10 @@ namespace urpc
             v = tmp;
             return true;
         }
-        else if constexpr (std::is_same_v<T, std::string>)
-        {
-            return get_bytes(b, v);
-        }
-        else
-        {
-            static_assert(!sizeof(T*), "dec_prim unsupported type");
-        }
+        else if constexpr (std::is_same_v<T, std::string>) { return get_bytes(b, v); }
+        else { static_assert(!sizeof(T*), "dec_prim unsupported type"); }
     }
 
-    // ===========
-    // Forwarding
-    // ===========
-    template <class T> inline void encode(std::string& o, const T& v);
-    template <class T> inline bool decode(Buf& b, T& v);
-
-    // ================
-    // std::vector<T>
-    // ================
     template <class T>
     inline void encode(std::string& o, const std::vector<T>& v)
     {
@@ -269,14 +250,10 @@ namespace urpc
         uint64_t cnt{};
         if (!get_varu(b, cnt)) return false;
         v.resize(static_cast<size_t>(cnt));
-        for (auto& e : v)
-            if (!decode(b, e)) return false;
+        for (auto& e : v) if (!decode(b, e)) return false;
         return true;
     }
 
-    // ===============
-    // std::optional<T>
-    // ===============
     template <class T>
     inline void encode(std::string& o, const std::optional<T>& v)
     {
@@ -289,17 +266,18 @@ namespace urpc
     {
         uint8_t c{};
         if (!b.get(c)) return false;
-        if (!c) { v.reset(); return true; }
+        if (!c)
+        {
+            v.reset();
+            return true;
+        }
         T tmp{};
         if (!decode(b, tmp)) return false;
         v = std::move(tmp);
         return true;
     }
 
-    // ======
-    // enums
-    // ======
-    template <class E> concept Enum = std::is_enum_v[E];
+    template <class E> concept Enum = std::is_enum_v<E>;
 
     template <Enum E>
     inline void encode(std::string& o, const E& e)
@@ -318,9 +296,6 @@ namespace urpc
         return true;
     }
 
-    // ==========================
-    // std::array<T, N> (fixed)
-    // ==========================
     template <class T, size_t N>
     inline void encode(std::string& o, const std::array<T, N>& a)
     {
@@ -330,33 +305,25 @@ namespace urpc
     template <class T, size_t N>
     inline bool decode(Buf& b, std::array<T, N>& a)
     {
-        for (auto& e : a)
-            if (!decode(b, e)) return false;
+        for (auto& e : a) if (!decode(b, e)) return false;
         return true;
     }
 
-    // ==========================
-    // std::tuple<Ts...> (opt)
-    // ==========================
     template <class... Ts>
     inline void encode(std::string& o, const std::tuple<Ts...>& tp)
     {
-        std::apply([&](const Ts&... xs){ (encode(o, xs), ...); }, tp);
+        std::apply([&](const Ts&... xs) { (encode(o, xs), ...); }, tp);
     }
 
     template <class... Ts>
     inline bool decode(Buf& b, std::tuple<Ts...>& tp)
     {
         bool ok = true;
-        std::apply([&](Ts&... xs){
-            ((ok = ok && decode(b, xs)), ...);
-        }, tp);
+        std::apply([&](Ts&... xs) { ((ok = ok && decode(b, xs)), ...); }, tp);
         return ok;
     }
 
-    // ================================
-    // Generic object via ureflect::tie
-    // ================================
+    // -------- generic via ureflect::tie (без std::tuple_size/std::get) --------
     template <class T>
     inline void encode(std::string& o, const T& obj)
     {
@@ -366,14 +333,16 @@ namespace urpc
         }
         else if constexpr (Enum<T>)
         {
-            encode(o, static_cast<T>(obj));
+            using U = std::underlying_type_t<T>;
+            enc_prim(o, static_cast<U>(obj));
         }
         else
         {
+            constexpr auto N = ureflect::count_members<T>;
             auto tie = ureflect::to_tie(const_cast<T&>(obj));
-            constexpr auto N = std::tuple_size_v<decltype(tie)>;
-            [&]<size_t... I>(std::index_sequence<I...>){
-                (encode(o, std::get<I>(tie)), ...);
+            [&]<size_t... I>(std::index_sequence<I...>)
+            {
+                (encode(o, ureflect::get<I>(tie)), ...);
             }(std::make_index_sequence<N>{});
         }
     }
@@ -387,20 +356,29 @@ namespace urpc
         }
         else if constexpr (Enum<T>)
         {
-            return decode(b, reinterpret_cast<std::underlying_type_t<T>&>(obj));
+            using U = std::underlying_type_t<T>;
+            U u{};
+            if (!dec_prim(b, u)) return false;
+            obj = static_cast<T>(u);
+            return true;
         }
         else
         {
+            constexpr auto N = ureflect::count_members<T>;
             auto tie = ureflect::to_tie(obj);
-            constexpr auto N = std::tuple_size_v<decltype(tie)>;
             bool ok = true;
-            [&]<size_t... I>(std::index_sequence<I...>){
-                ((ok = ok && decode(b, std::get<I>(tie))), ...);
+            [&]<size_t... I>(std::index_sequence<I...>)
+            {
+                ((ok = ok && decode(b, ureflect::get<I>(tie))), ...);
             }(std::make_index_sequence<N>{});
             return ok;
         }
     }
 
+    inline uint64_t method_id(std::string_view name)
+    {
+        return fnv1a64_fast(name);
+    }
 } // namespace urpc
 
 #endif // CODEC_H

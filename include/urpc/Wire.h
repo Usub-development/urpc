@@ -1,7 +1,6 @@
 //
 // Created by root on 11/4/25.
 //
-
 #ifndef WIRE_H
 #define WIRE_H
 
@@ -11,6 +10,7 @@
 #include <string>
 #include <span>
 #include <array>
+#include <type_traits>
 
 namespace urpc
 {
@@ -24,6 +24,8 @@ namespace urpc
         F_TP_CUSTOM = 0b11,
     };
 
+    enum class TransportMode : uint8_t { RAW = 0, TLS = 1, MTLS = 2, CUSTOM = 3 };
+
     inline uint8_t flags_set_transport(uint8_t f, uint8_t tp2bits)
     {
         return static_cast<uint8_t>((f & ~0b11u) | (tp2bits & 0b11u));
@@ -32,9 +34,7 @@ namespace urpc
     inline uint8_t flags_get_transport(uint8_t f) { return static_cast<uint8_t>(f & 0b11u); }
 
     [[nodiscard]] inline bool flags_has(uint8_t f, uint8_t mask) { return (f & mask) != 0; }
-
     inline void flags_set(uint8_t& f, uint8_t mask) { f = static_cast<uint8_t>(f | mask); }
-
     inline void flags_unset(uint8_t& f, uint8_t mask) { f = static_cast<uint8_t>(f & ~mask); }
 
     enum : uint8_t
@@ -59,6 +59,7 @@ namespace urpc
 #pragma pack(push,1)
     struct UrpcHdr
     {
+        // len = meta_len + body_len   (ВАЖНО: без HDR_NO_LEN)
         uint32_t len;
         uint8_t ver{1};
         uint8_t type{0};
@@ -99,13 +100,13 @@ namespace urpc
         return v;
     }
 
-    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4;
-    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN;
+    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4; // = 24
+    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN; // = 28
 
     inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
     {
         out.reserve(out.size() + HDR_SIZE);
-        put_le32(out, h.len);
+        put_le32(out, h.len); // len = meta_len + body_len
         out.push_back(static_cast<char>(h.ver));
         out.push_back(static_cast<char>(h.type));
         out.push_back(static_cast<char>(h.flags));
@@ -130,24 +131,23 @@ namespace urpc
         const size_t n = buf.size();
         if (n < HDR_SIZE) return std::nullopt;
 
-        auto ptr = [&](size_t idx) -> const char*
+        auto u8 = [&](size_t idx)-> uint8_t
+        {
+            return static_cast<uint8_t>(std::to_integer<unsigned char>(buf[idx]));
+        };
+        auto ptr = [&](size_t idx)-> const char*
         {
             return reinterpret_cast<const char*>(buf.data() + idx);
         };
 
         size_t i = 0;
         UrpcHdr h{};
-
         h.len = get_le32(ptr(i));
         i += 4;
-        h.ver = static_cast<uint8_t>(*(ptr(i) + 0));
-        i += 1;
-        h.type = static_cast<uint8_t>(*(ptr(i) + 0));
-        i += 1;
-        h.flags = static_cast<uint8_t>(*(ptr(i) + 0));
-        i += 1;
-        h.rsv = static_cast<uint8_t>(*(ptr(i) + 0));
-        i += 1;
+        h.ver = u8(i++);
+        h.type = u8(i++);
+        h.flags = u8(i++);
+        h.rsv = u8(i++);
         h.stream = get_le32(ptr(i));
         i += 4;
         h.method = get_le64(ptr(i));
@@ -157,9 +157,9 @@ namespace urpc
         h.body_len = get_le32(ptr(i));
         i += 4;
 
-        const uint64_t expect = static_cast<uint64_t>(HDR_NO_LEN) + h.meta_len + h.body_len;
+        const uint64_t expect = static_cast<uint64_t>(h.meta_len) + h.body_len;
         if (h.len != expect) return std::nullopt;
-        if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
+        if (n < HDR_SIZE + expect) return std::nullopt;
 
         return h;
     }
@@ -181,7 +181,7 @@ namespace urpc
     {
         h.meta_len = static_cast<uint32_t>(meta.size());
         h.body_len = static_cast<uint32_t>(body.size());
-        h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
+        h.len = static_cast<uint32_t>(h.meta_len + h.body_len);
 
         std::string out;
         out.reserve(HDR_SIZE + h.meta_len + h.body_len);
@@ -204,32 +204,38 @@ namespace urpc
         return true;
     }
 
-    inline std::string make_settings_frame(bool use_tls, bool use_mtls, std::string&& meta_json)
+    inline uint8_t transport_bits_of(TransportMode m)
+    {
+        switch (m)
+        {
+        case TransportMode::RAW: return F_TP_RAW;
+        case TransportMode::TLS: return F_TP_TLS;
+        case TransportMode::MTLS: return F_TP_MTLS;
+        case TransportMode::CUSTOM: return F_TP_CUSTOM;
+        }
+        return F_TP_RAW;
+    }
+
+    [[nodiscard]] inline uint8_t derive_transport_flags(TransportMode m, uint8_t base = 0)
+    {
+        return flags_set_transport(base, transport_bits_of(m));
+    }
+
+    [[nodiscard]] inline UrpcHdr make_settings_hdr(TransportMode m)
     {
         UrpcHdr h{};
         h.type = static_cast<uint8_t>(MsgType::REQUEST);
         h.stream = SETTINGS_STREAM;
         h.method = SETTINGS_METHOD;
-
-        const uint8_t tp = use_mtls ? F_TP_MTLS : (use_tls ? F_TP_TLS : F_TP_RAW);
-        h.flags = flags_set_transport(h.flags, tp);
-        if (!meta_json.empty()) h.flags |= F_CB_PRESENT;
-
-        return make_frame(h, std::move(meta_json), {});
+        h.flags = derive_transport_flags(m);
+        return h;
     }
 
     [[nodiscard]] inline bool validate_first_settings(const ParsedFrame& pf, bool is_tls, bool is_mtls)
     {
-        if (pf.h.stream != SETTINGS_STREAM || pf.h.method != SETTINGS_METHOD)
-            return false;
+        if (pf.h.stream != SETTINGS_STREAM || pf.h.method != SETTINGS_METHOD) return false;
         return transport_matches(is_tls, is_mtls, pf.h.flags);
     }
-
-    [[nodiscard]] inline uint8_t derive_transport_flags(bool use_tls, bool use_mtls, uint8_t base = 0)
-    {
-        const uint8_t tp = use_mtls ? F_TP_MTLS : (use_tls ? F_TP_TLS : F_TP_RAW);
-        return flags_set_transport(base, tp);
-    }
-}
+} // namespace urpc
 
 #endif // WIRE_H
