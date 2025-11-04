@@ -256,19 +256,6 @@ namespace urpc
         return true;
     }
 
-    template <class A, class B>
-    inline void encode(std::string& o, const std::pair<A, B>& p)
-    {
-        encode(o, p.first);
-        encode(o, p.second);
-    }
-
-    template <class A, class B>
-    inline bool decode(Buf& b, std::pair<A, B>& p)
-    {
-        return decode(b, p.first) && decode(b, p.second);
-    }
-
     template <class T>
     inline void encode(std::string& o, const std::optional<T>& v)
     {

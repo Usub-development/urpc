@@ -62,13 +62,18 @@ set_target_properties(urpc PROPERTIES
 
 option(URPC_BUILD_EXAMPLES "Build urpc example executables" ON)
 if (URPC_BUILD_EXAMPLES)
-    add_executable(urpc_example examples/main.cpp)
+    add_executable(urpc_example examples/main.cpp
+            examples/interceptor_demo.cpp)
     target_link_libraries(urpc_example PRIVATE urpc)
     target_compile_definitions(urpc_example PRIVATE DEV_STAGE=${DEV_STAGE})
 
     add_executable(urpc_example_ping_inbox examples/main_ping_inbox.cpp)
     target_link_libraries(urpc_example_ping_inbox PRIVATE urpc)
     target_compile_definitions(urpc_example_ping_inbox PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_interceptors examples/interceptor_demo.cpp)
+    target_link_libraries(urpc_example_interceptors PRIVATE urpc)
+    target_compile_definitions(urpc_example_interceptors PRIVATE DEV_STAGE=${DEV_STAGE})
 endif()
 
 install(TARGETS urpc

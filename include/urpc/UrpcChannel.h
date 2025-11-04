@@ -8,8 +8,7 @@
 #include <utility>
 #include <variant>
 #include <deque>
-#include <memory>
-#include <chrono>
+#include <vector>
 
 #include "Wire.h"
 #include "Codec.h"
@@ -17,17 +16,11 @@
 #include "UrpcSettings.h"
 #include "UrpcSettingsIO.h"
 #include "UrpcSettingsBuilder.h"
-#include "uvent/Uvent.h"
+#include "urpc/Interceptors.h"
 #include "uvent/utils/datastructures/queue/ConcurrentQueues.h"
 
 namespace urpc
 {
-    struct CallOpts
-    {
-        std::optional<std::chrono::steady_clock::time_point> deadline;
-        bool send_cancel_on_deadline{true};
-    };
-
     template <TransportLike T>
     class Channel
     {
@@ -43,9 +36,12 @@ namespace urpc
         usub::uvent::task::Awaitable<bool> open(const UrpcSettingsBuilder& builder)
         {
             if (!(co_await builder.send(this->tr_))) co_return false;
+
             auto pf = co_await this->tr_.recv_frame();
             if (!pf) co_return false;
-            if (!validate_first_settings(*pf, this->matches_tls(), this->matches_mtls())) co_return false;
+            if (!validate_first_settings(*pf, this->matches_tls(), this->matches_mtls()))
+                co_return false;
+
             if (!pf->meta.empty())
             {
                 Buf b{pf->meta};
@@ -56,19 +52,23 @@ namespace urpc
             co_return true;
         }
 
+        void add_interceptor(ClientInterceptor ix) { this->interceptors_.push_back(std::move(ix)); }
+        void clear_interceptors() { this->interceptors_.clear(); }
+
         template <class Req, class Resp>
-        usub::uvent::task::Awaitable<std::optional<Resp>> unary_by_name(std::string_view name, const Req& req,
-                                                                        const CallOpts* opts = nullptr)
+        usub::uvent::task::Awaitable<std::optional<Resp>>
+        unary_by_name(std::string_view name, const Req& req)
         {
             co_return co_await this->unary<Req, std::monostate, Resp, std::monostate>(
-                method_id(name), std::monostate{}, req, nullptr, opts);
+                method_id(name), std::monostate{}, req, nullptr);
         }
 
         template <class Req, class MetaIn = std::monostate, class Resp = std::monostate, class MetaOut = std::monostate>
         usub::uvent::task::Awaitable<std::optional<Resp>>
-        unary(uint64_t method, const MetaIn& meta_in, const Req& req, MetaOut* out_meta, const CallOpts* opts = nullptr)
+        unary(uint64_t method, const MetaIn& meta_in, const Req& req, MetaOut* out_meta)
         {
             if (this->busy_.exchange(true, std::memory_order_acq_rel)) co_return std::nullopt;
+
             const uint32_t stream = this->next_stream_.fetch_add(1, std::memory_order_relaxed);
 
             std::string meta_bin, body_bin;
@@ -81,35 +81,23 @@ namespace urpc
             h.stream = stream;
             h.method = method;
 
-            std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
-            if (opts && opts->deadline.has_value())
-            {
-                auto deadline = *opts->deadline;
-                usub::uvent::system::co_spawn(
-                    [this, stream, done, opts, deadline]() -> usub::uvent::task::Awaitable<void>
-                    {
-                        auto now = std::chrono::steady_clock::now();
-                        if (deadline > now) co_await usub::uvent::system::this_coroutine::sleep_for(deadline - now);
-                        if (!done->load(std::memory_order_acquire) && opts->send_cancel_on_deadline) (void)co_await this
-                            ->cancel(stream);
-                        co_return;
-                    }());
-            }
+            this->apply_before_send(h, meta_bin, body_bin);
 
             std::string frame = make_frame(h, std::move(meta_bin), std::move(body_bin));
             if (!(co_await this->tr_.send_frame(std::move(frame))))
             {
                 this->busy_.store(false, std::memory_order_release);
-                if (done) done->store(true, std::memory_order_release);
                 co_return std::nullopt;
             }
 
-            auto pfopt = co_await this->tr_.recv_frame();
-            if (done) done->store(true, std::memory_order_release);
+            auto pfopt0 = co_await this->tr_.recv_frame();
             this->busy_.store(false, std::memory_order_release);
-            if (!pfopt) co_return std::nullopt;
+            if (!pfopt0) co_return std::nullopt;
 
-            const auto& pf = *pfopt;
+            auto pfmut = *pfopt0;
+            this->apply_after_recv(pfmut);
+            const auto& pf = pfmut;
+
             if (pf.h.stream != stream) co_return std::nullopt;
             if (pf.h.type == static_cast<uint8_t>(MsgType::ERROR)) co_return std::nullopt;
             if (pf.h.type != static_cast<uint8_t>(MsgType::RESPONSE)) co_return std::nullopt;
@@ -123,7 +111,56 @@ namespace urpc
             Resp resp{};
             Buf bb{pf.body};
             if (!decode(bb, resp)) co_return std::nullopt;
+
             co_return resp;
+        }
+
+        template <class Req, class Resp, class OnMsg>
+        usub::uvent::task::Awaitable<bool>
+        server_streaming_by_name(std::string_view name, const Req& req, OnMsg on_msg)
+        {
+            const uint64_t method = method_id(name);
+            const uint32_t stream = this->next_stream_.fetch_add(1, std::memory_order_relaxed);
+
+            std::string meta_bin, body_bin;
+            encode(meta_bin, std::monostate{});
+            encode(body_bin, req);
+
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::REQUEST);
+            h.flags = this->tr_.transport_bits();
+            h.stream = stream;
+            h.method = method;
+
+            this->apply_before_send(h, meta_bin, body_bin);
+
+            std::string frame = make_frame(h, std::move(meta_bin), std::move(body_bin));
+            if (!(co_await this->tr_.send_frame(std::move(frame)))) co_return false;
+
+            for (;;)
+            {
+                auto pf0 = co_await this->tr_.recv_frame();
+                if (!pf0) co_return false;
+
+                this->apply_after_recv(*pf0);
+
+                if (pf0->h.stream != stream)
+                {
+                    if (this->inbox_) (void)this->inbox_->try_enqueue(std::move(*pf0));
+                    continue;
+                }
+                if (pf0->h.type == uint8_t(MsgType::ERROR)) co_return false;
+                if (pf0->h.type != uint8_t(MsgType::RESPONSE)) continue;
+
+                Resp item{};
+                Buf bb{pf0->body};
+                if (!decode(bb, item)) co_return false;
+
+                if (!co_await on_msg(std::move(item))) co_return false;
+
+                if (is_stream_last(pf0->h.flags)) break;
+            }
+            co_return true;
         }
 
         struct Stream
@@ -139,13 +176,17 @@ namespace urpc
         stream_open(uint64_t method, uint32_t init_in_credit = 16, uint32_t init_out_credit = 16)
         {
             const uint32_t stream = this->next_stream_.fetch_add(1, std::memory_order_relaxed);
+
             UrpcHdr h{};
             h.type = uint8_t(MsgType::REQUEST);
             h.flags = this->tr_.transport_bits();
             h.stream = stream;
             h.method = method;
+
             std::string frame = make_frame(h, {}, {});
-            if (!(co_await this->tr_.send_frame(std::move(frame)))) co_return std::nullopt;
+            if (!(co_await this->tr_.send_frame(std::move(frame))))
+                co_return std::nullopt;
+
             Stream s{&this->tr_, stream, method, init_out_credit, init_in_credit};
             co_return s;
         }
@@ -155,6 +196,7 @@ namespace urpc
         {
             if (s.out_credit == 0) co_return false;
             --s.out_credit;
+
             UrpcHdr h{};
             h.type = uint8_t(MsgType::REQUEST);
             h.flags = s.tr->transport_bits();
@@ -182,6 +224,7 @@ namespace urpc
             h.flags = s.tr->transport_bits() | F_FLOW_CREDIT;
             h.stream = s.stream;
             h.method = s.method;
+
             std::string body;
             put_varu(body, credit);
             std::string frame = make_frame(h, {}, std::move(body));
@@ -248,7 +291,9 @@ namespace urpc
 
             for (;;)
             {
-                if (!this->alive() || !this->inbox_run_.load(std::memory_order_acquire)) break;
+                if (!this->alive() || !this->inbox_run_.load(std::memory_order_acquire))
+                    break;
+
                 auto pf = co_await this->tr_.recv_frame();
                 if (!pf) break;
 
@@ -266,8 +311,8 @@ namespace urpc
                     {
                         ParsedFrame junk;
                         (void)this->inbox_->try_dequeue(junk);
-                        if (!this->inbox_->try_enqueue(std::move(*pf))) this->ovf_count_.fetch_add(
-                            1, std::memory_order_relaxed);
+                        if (!this->inbox_->try_enqueue(std::move(*pf)))
+                            this->ovf_count_.fetch_add(1, std::memory_order_relaxed);
                     }
                     else
                     {
@@ -292,16 +337,29 @@ namespace urpc
             return flags_get_transport(this->tr_.transport_bits()) == F_TP_MTLS;
         }
 
+        void apply_before_send(UrpcHdr& h, std::string& meta, std::string& body)
+        {
+            for (auto& ix : this->interceptors_) if (ix.before_send) ix.before_send(h, meta, body);
+        }
+
+        void apply_after_recv(ParsedFrame& pf)
+        {
+            for (auto& ix : this->interceptors_) if (ix.after_recv) ix.after_recv(pf);
+        }
+
     private:
         T tr_;
         std::atomic<uint32_t> next_stream_{1};
         std::atomic<bool> busy_{false};
         bool opened_{false};
         std::optional<UrpcSettingsMeta> peer_settings_{};
+
         std::unique_ptr<usub::queue::concurrent::SPSCQueue<ParsedFrame>> inbox_;
         std::atomic<bool> inbox_run_{false};
         std::atomic<uint64_t> ovf_count_{0};
         bool drop_oldest_{true};
+
+        std::vector<ClientInterceptor> interceptors_;
     };
 
     template <RWLike RW>

@@ -1,3 +1,4 @@
+// Wire.h
 #ifndef WIRE_H
 #define WIRE_H
 
@@ -9,8 +10,6 @@
 #include <array>
 #include <type_traits>
 #include <variant>
-#include <vector>
-#include <utility>
 
 namespace urpc
 {
@@ -182,6 +181,7 @@ namespace urpc
         h.meta_len = static_cast<uint32_t>(meta.size());
         h.body_len = static_cast<uint32_t>(body.size());
         h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
+
         std::string out;
         out.reserve(HDR_SIZE + h.meta_len + h.body_len);
         hdr_encode_into(out, h);
@@ -194,6 +194,7 @@ namespace urpc
     {
         const auto hopt = hdr_decode(p, n);
         if (!hopt) return false;
+
         pf.h = *hopt;
         const size_t meta_off = HDR_SIZE;
         const size_t body_off = HDR_SIZE + pf.h.meta_len;
@@ -238,19 +239,31 @@ namespace urpc
     inline bool is_stream_last(uint8_t flags) { return flags_has(flags, F_STREAM_LAST); }
     inline bool is_credit_frame(uint8_t flags) { return flags_has(flags, F_FLOW_CREDIT); }
 
-    struct RpcError
+    enum class StatusCode : uint32_t
     {
-        uint32_t code{};
-        std::string message;
+        OK = 0,
+        CANCELLED = 1,
+        UNKNOWN = 2,
+        INVALID_ARGUMENT = 3,
+        DEADLINE_EXCEEDED = 4,
+        NOT_FOUND = 5,
+        ALREADY_EXISTS = 6,
+        PERMISSION_DENIED = 7,
+        RESOURCE_EXHAUSTED = 8,
+        FAILED_PRECONDITION = 9,
+        ABORTED = 10,
+        OUT_OF_RANGE = 11,
+        UNIMPLEMENTED = 12,
+        INTERNAL = 13,
+        UNAVAILABLE = 14,
+        DATA_LOSS = 15,
+        UNAUTHENTICATED = 16
     };
 
-    using MetaKV = std::vector<std::pair<std::string, std::string>>;
-
-    struct Status
+    struct RpcError
     {
-        uint32_t code{};
+        StatusCode code{};
         std::string message;
-        MetaKV trailers;
     };
 
     template <class T>
