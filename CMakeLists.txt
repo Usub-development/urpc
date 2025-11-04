@@ -39,8 +39,7 @@ file(GLOB_RECURSE URPC_SOURCES CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/src/urpc/*.cpp
 )
 
-add_library(urpc ${URPC_SOURCES} ${URPC_HEADERS}
-        include/urpc/Codec.h)
+add_library(urpc ${URPC_SOURCES} ${URPC_HEADERS})
 add_library(usub::urpc ALIAS urpc)
 
 target_include_directories(urpc
