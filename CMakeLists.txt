@@ -62,8 +62,7 @@ set_target_properties(urpc PROPERTIES
 
 option(URPC_BUILD_EXAMPLES "Build urpc example executables" ON)
 if (URPC_BUILD_EXAMPLES)
-    add_executable(urpc_example examples/main.cpp
-            examples/interceptor_demo.cpp)
+    add_executable(urpc_example examples/main.cpp)
     target_link_libraries(urpc_example PRIVATE urpc)
     target_compile_definitions(urpc_example PRIVATE DEV_STAGE=${DEV_STAGE})
 

@@ -1,5 +1,5 @@
-#ifndef CODEC_H
-#define CODEC_H
+#ifndef URPC_CODEC_H
+#define URPC_CODEC_H
 
 #include <string>
 #include <string_view>
@@ -13,11 +13,13 @@
 #include <cstdint>
 #include <cstring>
 #include <variant>
+
 #include "ureflect/ureflect_auto.h"
 #include "Wire.h"
 
 namespace urpc
 {
+    // ===== buffer view for decode =====
     struct Buf
     {
         const char* p{};
@@ -42,7 +44,7 @@ namespace urpc
         bool get(uint8_t& b)
         {
             if (i >= n) return false;
-            b = static_cast<uint8_t>(p[i++]);
+            b = (uint8_t)p[i++];
             return true;
         }
 
@@ -62,14 +64,15 @@ namespace urpc
         }
     };
 
+    // ===== varint =====
     inline void put_varu(std::string& o, uint64_t v)
     {
         while (v >= 0x80)
         {
-            o.push_back(static_cast<char>((v & 0x7F) | 0x80));
+            o.push_back(char((v & 0x7F) | 0x80));
             v >>= 7;
         }
-        o.push_back(static_cast<char>(v));
+        o.push_back(char(v));
     }
 
     inline bool get_varu(Buf& b, uint64_t& v)
@@ -98,7 +101,7 @@ namespace urpc
     {
         uint64_t u{};
         if (!get_varu(b, u)) return false;
-        s = static_cast<int64_t>((u >> 1) ^ (~(u & 1) + 1));
+        s = (int64_t)((u >> 1) ^ (~(u & 1) + 1));
         return true;
     }
 
@@ -114,11 +117,12 @@ namespace urpc
         if (!get_varu(b, len)) return false;
         if (len > b.remaining()) return false;
         if (len > MAX_FRAME_NO_LEN) return false;
-        out.assign(b.p + b.i, b.p + b.i + static_cast<size_t>(len));
-        b.i += static_cast<size_t>(len);
+        out.assign(b.p + b.i, b.p + b.i + (size_t)len);
+        b.i += (size_t)len;
         return true;
     }
 
+    // ===== fast FNV1a =====
     inline uint64_t fnv1a64_fast(const uint8_t* p, size_t n)
     {
         constexpr uint64_t FNV_OFFSET = 1469598103934665603ull, FNV_PRIME = 1099511628211ull;
@@ -127,21 +131,21 @@ namespace urpc
         {
             uint64_t v;
             std::memcpy(&v, p, 8);
-            h ^= static_cast<uint8_t>(v >> 0);
+            h ^= uint8_t(v >> 0);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 8);
+            h ^= uint8_t(v >> 8);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 16);
+            h ^= uint8_t(v >> 16);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 24);
+            h ^= uint8_t(v >> 24);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 32);
+            h ^= uint8_t(v >> 32);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 40);
+            h ^= uint8_t(v >> 40);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 48);
+            h ^= uint8_t(v >> 48);
             h *= FNV_PRIME;
-            h ^= static_cast<uint8_t>(v >> 56);
+            h ^= uint8_t(v >> 56);
             h *= FNV_PRIME;
             p += 8;
             n -= 8;
@@ -159,6 +163,63 @@ namespace urpc
         return fnv1a64_fast(reinterpret_cast<const uint8_t*>(s.data()), s.size());
     }
 
+    // ===== zero-copy helpers for encode path =====
+    struct SpanBuf
+    {
+        std::span<const std::byte> view;
+        size_t i{};
+        [[nodiscard]] size_t remaining() const { return view.size() - i; }
+
+        bool read(size_t n, const std::byte*& p)
+        {
+            if (remaining() < n) return false;
+            p = view.data() + i;
+            i += n;
+            return true;
+        }
+    };
+
+    template <class T>
+    inline size_t enc_sizeof(const T& v)
+    {
+        if constexpr (std::is_same_v<T, std::string>) return 10 + v.size();
+        if constexpr (std::is_arithmetic_v<T>) return 10;
+        return 64;
+    }
+
+    template <class T>
+    inline size_t encode_into(std::span<std::byte> out, const T& v)
+    {
+        std::string tmp;
+        tmp.reserve(enc_sizeof(v));
+        encode(tmp, v);
+        if (out.size() < tmp.size()) return 0;
+        std::memcpy(out.data(), tmp.data(), tmp.size());
+        return tmp.size();
+    }
+
+    // ===== compression stubs =====
+    inline bool compress_into(CompressionKind c, std::span<const std::byte> src, std::string& out)
+    {
+        if (c == CompressionKind::NONE)
+        {
+            out.append((const char*)src.data(), src.size());
+            return true;
+        }
+        return false;
+    }
+
+    inline bool decompress_into(CompressionKind c, std::span<const std::byte> src, std::string& out)
+    {
+        if (c == CompressionKind::NONE)
+        {
+            out.append((const char*)src.data(), src.size());
+            return true;
+        }
+        return false;
+    }
+
+    // ===== generic (existing) encode/decode =====
     template <class T>
     inline void encode(std::string& o, const T& v);
     template <class T>
@@ -174,8 +235,8 @@ namespace urpc
     inline void enc_prim(std::string& o, const T& v)
     {
         if constexpr (std::is_same_v<T, bool>) { o.push_back(v ? char(1) : char(0)); }
-        else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) { put_vars(o, static_cast<int64_t>(v)); }
-        else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) { put_varu(o, static_cast<uint64_t>(v)); }
+        else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) { put_vars(o, (int64_t)v); }
+        else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) { put_varu(o, (uint64_t)v); }
         else if constexpr (std::is_same_v<T, float>)
         {
             const auto bits = std::bit_cast<std::array<char, 4>>(v);
@@ -207,14 +268,14 @@ namespace urpc
         {
             int64_t s{};
             if (!get_vars(b, s)) return false;
-            v = static_cast<T>(s);
+            v = (T)s;
             return true;
         }
         else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>)
         {
             uint64_t u{};
             if (!get_varu(b, u)) return false;
-            v = static_cast<T>(u);
+            v = (T)u;
             return true;
         }
         else if constexpr (std::is_same_v<T, float>)
@@ -251,7 +312,7 @@ namespace urpc
     {
         uint64_t cnt{};
         if (!get_varu(b, cnt)) return false;
-        v.resize(static_cast<size_t>(cnt));
+        v.resize((size_t)cnt);
         for (auto& e : v) if (!decode(b, e)) return false;
         return true;
     }
@@ -285,7 +346,7 @@ namespace urpc
     inline void encode(std::string& o, const E& e)
     {
         using U = std::underlying_type_t<E>;
-        enc_prim(o, static_cast<U>(e));
+        enc_prim(o, (U)e);
     }
 
     template <Enum E>
@@ -294,15 +355,12 @@ namespace urpc
         using U = std::underlying_type_t<E>;
         U u{};
         if (!dec_prim(b, u)) return false;
-        e = static_cast<E>(u);
+        e = (E)u;
         return true;
     }
 
     template <class T, size_t N>
-    inline void encode(std::string& o, const std::array<T, N>& a)
-    {
-        for (const auto& e : a) encode(o, e);
-    }
+    inline void encode(std::string& o, const std::array<T, N>& a) { for (const auto& e : a) encode(o, e); }
 
     template <class T, size_t N>
     inline bool decode(Buf& b, std::array<T, N>& a)
@@ -329,13 +387,11 @@ namespace urpc
     inline void encode(std::string& o, const T& obj)
     {
         if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>)
-        {
             enc_prim(o, obj);
-        }
         else if constexpr (Enum<T>)
         {
             using U = std::underlying_type_t<T>;
-            enc_prim(o, static_cast<U>(obj));
+            enc_prim(o, (U)obj);
         }
         else
         {
@@ -349,13 +405,13 @@ namespace urpc
     template <class T>
     inline bool decode(Buf& b, T& obj)
     {
-        if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, std::string>) { return dec_prim(b, obj); }
+        if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, std::string>) return dec_prim(b, obj);
         else if constexpr (Enum<T>)
         {
             using U = std::underlying_type_t<T>;
             U u{};
             if (!dec_prim(b, u)) return false;
-            obj = static_cast<T>(u);
+            obj = (T)u;
             return true;
         }
         else
@@ -369,10 +425,8 @@ namespace urpc
         }
     }
 
-    inline uint64_t method_id(std::string_view name)
-    {
-        return fnv1a64_fast(name);
-    }
+    // ===== method id =====
+    inline uint64_t method_id(std::string_view name) { return fnv1a64_fast(name); }
 } // namespace urpc
 
-#endif // CODEC_H
+#endif // URPC_CODEC_H

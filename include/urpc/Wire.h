@@ -1,6 +1,5 @@
-// Wire.h
-#ifndef WIRE_H
-#define WIRE_H
+#ifndef URPC_WIRE_H
+#define URPC_WIRE_H
 
 #include <cstdint>
 #include <cstddef>
@@ -13,12 +12,18 @@
 
 namespace urpc
 {
+    // ===== protocol ids / versions =====
+    inline constexpr uint16_t SPEC_MAGIC = 0x5552; // 'UR'
+    inline constexpr uint8_t SPEC_VER = 1;
+
+    // ===== message types =====
     enum class MsgType : uint8_t
     {
         REQUEST = 0, RESPONSE = 1, ERROR = 2, CANCEL = 3,
         PING = 4, PONG = 5, GOAWAY = 6
     };
 
+    // ===== transport bits =====
     enum : uint8_t
     {
         F_TP_RAW = 0b00,
@@ -40,85 +45,111 @@ namespace urpc
     inline void flags_set(uint8_t& f, uint8_t mask) { f = static_cast<uint8_t>(f | mask); }
     inline void flags_unset(uint8_t& f, uint8_t mask) { f = static_cast<uint8_t>(f & ~mask); }
 
+    // ===== frame flags =====
     enum : uint8_t
     {
         F_COMPRESSED = 1u << 2,
         F_CB_PRESENT = 1u << 3,
         F_STREAM_LAST = 1u << 4,
-        F_FLOW_CREDIT = 1u << 5
+        F_FLOW_CREDIT = 1u << 5,
+        F_GOAWAY = 1u << 6
     };
 
+    // ===== codec/compression kinds =====
+    enum class CodecKind : uint8_t { RAW = 0, JSON = 1 };
+
+    enum class CompressionKind : uint8_t { NONE = 0, GZIP = 1, ZSTD = 2 };
+
+    // ===== special streams/methods =====
     inline constexpr uint32_t SETTINGS_STREAM = 0;
     inline constexpr uint64_t SETTINGS_METHOD = 0;
 
-    [[nodiscard]] inline bool transport_matches(bool is_tls, bool is_mtls, uint8_t hdr_flags)
-    {
-        const uint8_t tp = flags_get_transport(hdr_flags);
-        if (tp == F_TP_RAW) return !is_tls && !is_mtls;
-        if (tp == F_TP_TLS) return is_tls && !is_mtls;
-        if (tp == F_TP_MTLS) return is_tls && is_mtls;
-        return true;
-    }
-
-#pragma pack(push,1)
-    struct UrpcHdr
-    {
-        uint32_t len;
-        uint8_t ver{1};
-        uint8_t type{0};
-        uint8_t flags{0};
-        uint8_t rsv{0};
-        uint32_t stream{0};
-        uint64_t method{0};
-        uint32_t meta_len{0};
-        uint32_t body_len{0};
-    };
-#pragma pack(pop)
-
+    // ===== helpers (LE io) =====
     inline void put_le32(std::string& o, uint32_t v)
     {
         std::array<char, 4> b{};
-        for (int i = 0; i < 4; ++i) b[static_cast<size_t>(i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
-        o.append(b.data(), b.data() + b.size());
+        for (int i = 0; i < 4; ++i) b[size_t(i)] = char((v >> (8 * i)) & 0xFF);
+        o.append(b.data(), b.size());
     }
 
     inline void put_le64(std::string& o, uint64_t v)
     {
         std::array<char, 8> b{};
-        for (int i = 0; i < 8; ++i) b[static_cast<size_t>(i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
-        o.append(b.data(), b.data() + b.size());
+        for (int i = 0; i < 8; ++i) b[size_t(i)] = char((v >> (8 * i)) & 0xFF);
+        o.append(b.data(), b.size());
     }
 
     inline uint32_t get_le32(const char* p)
     {
         uint32_t v = 0;
-        for (int i = 0; i < 4; ++i) v |= (static_cast<uint32_t>(static_cast<unsigned char>(p[i])) << (8 * i));
+        for (int i = 0; i < 4; ++i) v |= (uint32_t(uint8_t(p[i])) << (8 * i));
         return v;
     }
 
     inline uint64_t get_le64(const char* p)
     {
         uint64_t v = 0;
-        for (int i = 0; i < 8; ++i) v |= (static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (8 * i));
+        for (int i = 0; i < 8; ++i) v |= (uint64_t(uint8_t(p[i])) << (8 * i));
         return v;
     }
 
-    inline constexpr size_t HDR_NO_LEN = 1 + 1 + 1 + 1 + 4 + 8 + 4 + 4;
+    // ===== header =====
+#pragma pack(push,1)
+    struct UrpcHdr
+    {
+        uint32_t len; // total of [hdr-without-len + meta + body]
+        uint8_t ver{SPEC_VER};
+        uint8_t type{0};
+        uint8_t flags{0};
+        uint8_t rsv{0};
+        uint32_t stream{0};
+        uint64_t method{0};
+
+        // options
+        uint32_t timeout_ms{0};
+        uint64_t cancel_id{0};
+        uint8_t codec{uint8_t(CodecKind::RAW)};
+        uint8_t comp{uint8_t(CompressionKind::NONE)};
+        uint16_t spec{SPEC_MAGIC}; // magic
+
+        // payload sizes
+        uint32_t meta_len{0};
+        uint32_t body_len{0};
+    };
+#pragma pack(pop)
+
+    // compute constexpr sizes
+    inline constexpr size_t HDR_NO_LEN =
+        /*ver..rsv*/ (1 + 1 + 1 + 1) +
+        /*stream*/ 4 +
+        /*method*/ 8 +
+        /*timeout*/ 4 +
+        /*cancel*/ 8 +
+        /*codec..*/ (1 + 1 + 2) +
+        /*meta..*/ 4 + 4;
+
     inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN;
 
     inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024;
     inline constexpr int MAX_VARINT_SHIFT = 63;
 
+    // ===== encode/decode header =====
     inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
     {
         out.reserve(out.size() + HDR_SIZE);
         put_le32(out, h.len);
-        out.push_back(static_cast<char>(h.ver));
-        out.push_back(static_cast<char>(h.type));
-        out.push_back(static_cast<char>(h.flags));
-        out.push_back(static_cast<char>(h.rsv));
+        out.push_back(char(h.ver));
+        out.push_back(char(h.type));
+        out.push_back(char(h.flags));
+        out.push_back(char(h.rsv));
         put_le32(out, h.stream);
         put_le64(out, h.method);
+        put_le32(out, h.timeout_ms);
+        put_le64(out, h.cancel_id);
+        out.push_back(char(h.codec));
+        out.push_back(char(h.comp));
+        out.push_back(char(h.spec & 0xFF));
+        out.push_back(char((h.spec >> 8) & 0xFF));
         put_le32(out, h.meta_len);
         put_le32(out, h.body_len);
     }
@@ -136,7 +167,7 @@ namespace urpc
         const size_t n = buf.size();
         if (n < HDR_SIZE) return std::nullopt;
 
-        auto u8 = [&](size_t idx)-> uint8_t { return static_cast<uint8_t>(std::to_integer<unsigned char>(buf[idx])); };
+        auto u8 = [&](size_t idx)-> uint8_t { return uint8_t(std::to_integer<unsigned char>(buf[idx])); };
         auto ptr = [&](size_t idx)-> const char* { return reinterpret_cast<const char*>(buf.data() + idx); };
 
         size_t i = 0;
@@ -151,15 +182,24 @@ namespace urpc
         i += 4;
         h.method = get_le64(ptr(i));
         i += 8;
+        h.timeout_ms = get_le32(ptr(i));
+        i += 4;
+        h.cancel_id = get_le64(ptr(i));
+        i += 8;
+        h.codec = u8(i++);
+        h.comp = u8(i++);
+        h.spec = uint16_t(uint8_t(ptr(i)[0]) | (uint16_t(uint8_t(ptr(i)[1])) << 8));
+        i += 2;
         h.meta_len = get_le32(ptr(i));
         i += 4;
         h.body_len = get_le32(ptr(i));
         i += 4;
 
-        const uint64_t expect = static_cast<uint64_t>(HDR_NO_LEN) + h.meta_len + h.body_len;
+        const uint64_t expect = uint64_t(HDR_NO_LEN) + h.meta_len + h.body_len;
         if (h.len != expect) return std::nullopt;
         if (h.len < HDR_NO_LEN) return std::nullopt;
         if (h.len > HDR_NO_LEN + MAX_FRAME_NO_LEN) return std::nullopt;
+        if (h.ver != SPEC_VER || h.spec != SPEC_MAGIC) return std::nullopt;
         if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
         return h;
     }
@@ -169,6 +209,7 @@ namespace urpc
         return hdr_decode(std::span<const std::byte>(reinterpret_cast<const std::byte*>(p), n));
     }
 
+    // ===== frame =====
     struct ParsedFrame
     {
         UrpcHdr h{};
@@ -203,6 +244,7 @@ namespace urpc
         return true;
     }
 
+    // ===== transport bits derive =====
     inline uint8_t transport_bits_of(TransportMode m)
     {
         switch (m)
@@ -220,14 +262,24 @@ namespace urpc
         return flags_set_transport(base, transport_bits_of(m));
     }
 
+    // ===== settings / handshake helpers =====
     [[nodiscard]] inline UrpcHdr make_settings_hdr(TransportMode m)
     {
         UrpcHdr h{};
-        h.type = static_cast<uint8_t>(MsgType::REQUEST);
+        h.type = uint8_t(MsgType::REQUEST);
         h.stream = SETTINGS_STREAM;
         h.method = SETTINGS_METHOD;
         h.flags = derive_transport_flags(m);
         return h;
+    }
+
+    [[nodiscard]] inline bool transport_matches(bool is_tls, bool is_mtls, uint8_t hdr_flags)
+    {
+        const uint8_t tp = flags_get_transport(hdr_flags);
+        if (tp == F_TP_RAW) return !is_tls && !is_mtls;
+        if (tp == F_TP_TLS) return is_tls && !is_mtls;
+        if (tp == F_TP_MTLS) return is_tls && is_mtls;
+        return true;
     }
 
     [[nodiscard]] inline bool validate_first_settings(const ParsedFrame& pf, bool is_tls, bool is_mtls)
@@ -239,25 +291,14 @@ namespace urpc
     inline bool is_stream_last(uint8_t flags) { return flags_has(flags, F_STREAM_LAST); }
     inline bool is_credit_frame(uint8_t flags) { return flags_has(flags, F_FLOW_CREDIT); }
 
-    enum class StatusCode : uint32_t
+    // ===== status/error =====
+    enum class StatusCode : uint16_t
     {
-        OK = 0,
-        CANCELLED = 1,
-        UNKNOWN = 2,
-        INVALID_ARGUMENT = 3,
-        DEADLINE_EXCEEDED = 4,
-        NOT_FOUND = 5,
-        ALREADY_EXISTS = 6,
-        PERMISSION_DENIED = 7,
-        RESOURCE_EXHAUSTED = 8,
-        FAILED_PRECONDITION = 9,
-        ABORTED = 10,
-        OUT_OF_RANGE = 11,
-        UNIMPLEMENTED = 12,
-        INTERNAL = 13,
-        UNAVAILABLE = 14,
-        DATA_LOSS = 15,
-        UNAUTHENTICATED = 16
+        OK = 0, CANCELLED = 1, UNKNOWN = 2, INVALID_ARGUMENT = 3, DEADLINE_EXCEEDED = 4,
+        NOT_FOUND = 5, ALREADY_EXISTS = 6, PERMISSION_DENIED = 7, RESOURCE_EXHAUSTED = 8,
+        FAILED_PRECONDITION = 9, ABORTED = 10, OUT_OF_RANGE = 11, UNIMPLEMENTED = 12,
+        INTERNAL = 13, UNAVAILABLE = 14, DATA_LOSS = 15, UNAUTHENTICATED = 16,
+        PROTOCOL_ERROR = 1000, TRANSPORT_ERROR = 1001
     };
 
     struct RpcError
@@ -269,6 +310,7 @@ namespace urpc
     template <class T>
     using RpcExpected = std::variant<T, RpcError>;
 
+    // ===== ping/pong =====
     inline UrpcHdr make_ping(uint32_t stream = 0)
     {
         UrpcHdr h{};
@@ -287,4 +329,4 @@ namespace urpc
     }
 } // namespace urpc
 
-#endif // WIRE_H
+#endif // URPC_WIRE_H
