@@ -118,18 +118,16 @@ namespace urpc
     };
 #pragma pack(pop)
 
-    // compute constexpr sizes
     inline constexpr size_t HDR_NO_LEN =
-        /*ver..rsv*/ (1 + 1 + 1 + 1) +
-        /*stream*/ 4 +
-        /*method*/ 8 +
-        /*timeout*/ 4 +
-        /*cancel*/ 8 +
-        /*codec..*/ (1 + 1 + 2) +
-        /*meta..*/ 4 + 4;
+        (1 + 1 + 1 + 1) + // ver..rsv
+        4 + // stream
+        8 + // method
+        4 + // timeout
+        8 + // cancel
+        (1 + 1 + 2) + // codec, comp, spec
+        4 + 4; // meta, body
 
     inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN;
-
     inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024;
     inline constexpr int MAX_VARINT_SHIFT = 63;
 

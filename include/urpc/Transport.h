@@ -67,6 +67,13 @@ namespace urpc
         // coalescing API
         virtual void set_coalescing(CoalesceConfig cfg) { (void)cfg; }
         virtual usub::uvent::task::Awaitable<void> flush() { co_return; }
+
+        virtual usub::uvent::task::Awaitable<void> flush_guard(std::chrono::milliseconds d)
+        {
+            co_await usub::uvent::system::this_coroutine::sleep_for(d);
+            co_await flush();
+            co_return;
+        }
     };
 
     template <class T>
@@ -83,6 +90,7 @@ namespace urpc
             t.close();
         };
 
+
     template <RWLike RW>
     usub::uvent::task::Awaitable<bool> read_exact_into(RW& rw, std::string& dst, size_t need)
     {
@@ -98,9 +106,6 @@ namespace urpc
                 co_return false;
             }
             off += got;
-#ifdef UVENT_DEBUG
-        std::cout << "[transport] read_exact_into: got=" << got << " off=" << off << "/" << need << std::endl;
-#endif
         }
         co_return true;
     }
@@ -112,9 +117,6 @@ namespace urpc
         while (fr.rx.size() < HDR_SIZE)
         {
             const auto need = HDR_SIZE - fr.rx.size();
-#ifdef UVENT_DEBUG
-        std::cout << "[transport] recv_header: need " << need << " more bytes" << std::endl;
-#endif
             if (!(co_await read_exact_into(rw, fr.rx, need))) co_return std::nullopt;
         }
         auto hopt = hdr_decode(
@@ -127,9 +129,6 @@ namespace urpc
         const size_t now = fr.rx.size();
         if (now < total_need)
         {
-#ifdef UVENT_DEBUG
-        std::cout << "[transport] recv_header: payload need " << (total_need-now) << " bytes" << std::endl;
-#endif
             if (!(co_await read_exact_into(rw, fr.rx, total_need - now))) co_return std::nullopt;
         }
         co_return hdr_decode(
@@ -153,14 +152,6 @@ namespace urpc
 
         ParsedFrame pf{};
         if (!parse_frame(fr.rx.data(), total, pf)) co_return std::nullopt;
-
-#ifdef UVENT_DEBUG
-    std::cout << "[transport] recv_one: OK type=" << int(pf.h.type)
-              << " stream=" << pf.h.stream
-              << " method=" << pf.h.method
-              << " meta=" << pf.h.meta_len
-              << " body=" << pf.h.body_len << std::endl;
-#endif
 
         if (fr.rx.size() > total) fr.rx.erase(0, total);
         else fr.rx.clear();
@@ -236,7 +227,7 @@ namespace urpc
         bool flush_armed_{false};
     };
 
-    // ===== TLS placeholder transport (same write path; TLS handled externally) =====
+    // ===== TLS placeholder transport =====
     template <RWLike RW>
     class TlsTransport final : public ITransport
     {

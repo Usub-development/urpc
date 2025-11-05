@@ -1,3 +1,4 @@
+// examples/echo_demo.cpp
 #include "urpc/ServerRouter.h"
 #include "urpc/SocketRW.h"
 #include "urpc/UrpcChannel.h"
@@ -38,7 +39,7 @@ struct MulResp
 template <typename RW>
 task::Awaitable<bool> handshake_raw(RW& rw)
 {
-    std::cout << "[server] wait SETTINGS..." << std::endl;
+    std::cout << "[server] wait SETTINGS...\n";
     urpc::Framer fr;
     fr.transport_bits = urpc::derive_transport_flags(urpc::TransportMode::RAW);
 
@@ -49,7 +50,7 @@ task::Awaitable<bool> handshake_raw(RW& rw)
         << " stream=" << pf->h.stream
         << " method=" << pf->h.method
         << " meta=" << pf->meta.size()
-        << " body=" << pf->body.size() << std::endl;
+        << " body=" << pf->body.size() << "\n";
 
     if (!(pf->h.stream == urpc::SETTINGS_STREAM && pf->h.method == urpc::SETTINGS_METHOD))
         co_return false;
@@ -76,10 +77,7 @@ task::Awaitable<void> echo_svc(net::TCPServerSocket& srv)
     {
         std::cout << "[server] EchoReq: " << r.text << "\n";
         EchoResp resp{.text = "echo: " + r.text};
-
-        // Логирование перед отправкой ответа
         std::cout << "[server] sending response: " << resp.text << "\n";
-
         return resp;
     });
 
@@ -96,10 +94,11 @@ task::Awaitable<void> echo_svc(net::TCPServerSocket& srv)
                                                             using namespace std::chrono_literals;
                                                             for (int i = 1; i <= 3; ++i)
                                                             {
+                                                                bool last = (i == 3);
                                                                 (void)co_await w.write(EchoResp{
                                                                     .text = "chunk#" + std::to_string(i) + " for " +
                                                                     r.text
-                                                                }, i == 3); // отправка последнего чанка
+                                                                }, last);
                                                                 co_await usub::uvent::system::this_coroutine::sleep_for(
                                                                     150ms);
                                                             }
@@ -124,7 +123,6 @@ task::Awaitable<void> echo_svc(net::TCPServerSocket& srv)
     }
 }
 
-
 // ===== Client helpers =====
 template <class ChannelT>
 task::Awaitable<void> keepalive_loop(ChannelT& ch, int times, std::chrono::milliseconds period)
@@ -144,14 +142,34 @@ task::Awaitable<void> echo_stream_consumer(ChannelT& ch, std::string who)
 {
     bool ok = co_await ch.template server_streaming_by_name<EchoReq, EchoResp>(
         "EchoStream", EchoReq{.text = std::move(who)},
-        [](EchoResp item) -> usub::uvent::task::Awaitable<bool>
+        [](EchoResp item) -> task::Awaitable<bool>
         {
             std::cout << "[client] chunk: " << item.text << "\n";
-            co_return true; // continue reading
+            co_return true; // keep reading
         });
 
     std::cout << "[client] stream done: " << (ok ? "ok" : "fail") << "\n";
     co_return;
+}
+
+// Доп. демонстрация interceptors
+static urpc::ClientInterceptor make_trace_ix()
+{
+    urpc::ClientInterceptor ix;
+    ix.before_send = [](urpc::UrpcHdr& h, std::string&, std::string&)
+    {
+        // Пример: метим приоритет в flags/priority (если бы он писалcя в hdr)
+        (void)h;
+        std::cout << "[client/ix] before_send method=" << h.method
+            << " stream=" << h.stream << "\n";
+    };
+    ix.after_recv = [](urpc::ParsedFrame& pf)
+    {
+        std::cout << "[client/ix] after_recv type=" << int(pf.h.type)
+            << " stream=" << pf.h.stream
+            << " bytes=" << (urpc::HDR_SIZE + pf.meta.size() + pf.body.size()) << "\n";
+    };
+    return ix;
 }
 
 // ===== Client =====
@@ -160,7 +178,7 @@ task::Awaitable<void> run_client()
     using namespace std::chrono_literals;
     std::cout << "run_client\n";
 
-    co_await system::this_coroutine::sleep_for(150ms); // дождаться сервера
+    co_await system::this_coroutine::sleep_for(150ms); // чуть подождать сервер
 
     net::TCPClientSocket sock;
     {
@@ -188,6 +206,7 @@ task::Awaitable<void> run_client()
         .on_error = [](urpc::StatusCode c) { std::cout << "[client] err=" << (int)c << "\n"; },
         .on_keepalive = []() { std::cout << "[client] keepalive\n"; }
     });
+    ch.add_interceptor(make_trace_ix());
 
     bool ok = co_await ch.open(sb);
     std::cout << "[client] open=" << (ok ? "ok" : "fail") << "\n";
@@ -212,6 +231,10 @@ task::Awaitable<void> run_client()
 
     // server streaming
     co_await echo_stream_consumer(ch, "World");
+
+    // graceful close (GOAWAY) с reason
+    co_await ch.goaway("client shutdown");
+    std::cout << "[client] sent GOAWAY\n";
 
     co_return;
 }

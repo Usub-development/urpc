@@ -25,8 +25,7 @@ namespace urpc
     class Client
     {
     public:
-        explicit Client(T transport)
-            : ch_(Channel<T>(std::move(transport)))
+        explicit Client(T transport) : ch_(Channel<T>(std::move(transport)))
         {
         }
 
@@ -63,40 +62,35 @@ namespace urpc
                 name, req, std::move(on_msg));
         }
 
-        struct Stream
-        {
-            typename Channel<T>::Stream inner{};
-        };
+        // ===== Bidi stream API =====
+        using Stream = typename urpc::Channel<T>::Stream;
 
         usub::uvent::task::Awaitable<std::optional<Stream>>
         stream_open(std::string_view name, uint32_t init_in_credit = 16, uint32_t init_out_credit = 16)
         {
             const uint64_t method = method_id(name);
-            auto s = co_await ch_.stream_open(method, init_in_credit, init_out_credit);
-            if (!s) co_return std::nullopt;
-            Stream w{};
-            w.inner = *s;
-            co_return w;
+            co_return co_await ch_.stream_open(method, init_in_credit, init_out_credit);
         }
 
         usub::uvent::task::Awaitable<bool>
         stream_send(Stream& s, std::string meta, std::string body, bool last)
         {
-            co_return co_await Channel<T>::stream_send(s.inner, std::move(meta), std::move(body), last);
+            co_return co_await ch_.stream_send(s, std::move(meta), std::move(body), last);
         }
 
         usub::uvent::task::Awaitable<std::optional<ParsedFrame>>
         stream_recv(Stream& s)
         {
-            co_return co_await Channel<T>::stream_recv(s.inner);
+            co_return co_await ch_.stream_recv(s);
         }
 
         usub::uvent::task::Awaitable<bool>
         stream_grant_credit(Stream& s, uint32_t credit)
         {
-            co_return co_await Channel<T>::stream_grant_credit(s.inner, credit);
+            co_return co_await ch_.stream_grant_credit(s, credit);
         }
 
+        // Utils
         usub::uvent::task::Awaitable<bool> ping() { co_return co_await ch_.ping(); }
         usub::uvent::task::Awaitable<bool> cancel(uint32_t stream) { co_return co_await ch_.cancel(stream); }
 

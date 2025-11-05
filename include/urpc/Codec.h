@@ -122,6 +122,17 @@ namespace urpc
         return true;
     }
 
+    // ===== flow-credit helpers (meta varuint) =====
+    inline void put_credit_meta(std::string& o, uint32_t delta) { put_varu(o, (uint64_t)delta); }
+
+    inline bool get_credit_meta(Buf& b, uint32_t& delta)
+    {
+        uint64_t v{};
+        if (!get_varu(b, v) || v > 0xFFFFFFFFull) return false;
+        delta = (uint32_t)v;
+        return true;
+    }
+
     // ===== fast FNV1a =====
     inline uint64_t fnv1a64_fast(const uint8_t* p, size_t n)
     {
@@ -219,7 +230,7 @@ namespace urpc
         return false;
     }
 
-    // ===== generic (existing) encode/decode =====
+    // ===== generic encode/decode =====
     template <class T>
     inline void encode(std::string& o, const T& v);
     template <class T>

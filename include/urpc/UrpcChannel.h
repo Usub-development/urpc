@@ -64,7 +64,7 @@ namespace urpc
             co_return true;
         }
 
-        // ================= High-level facade: unary =================
+        // ================= High-level unary =================
         template <class Req, class Resp = std::monostate>
         usub::uvent::task::Awaitable<std::variant<Resp, RpcError>>
         send(std::string_view name, const Req& req, MetaOpts opts = {})
@@ -167,7 +167,7 @@ namespace urpc
             co_return resp;
         }
 
-        // ================= Server-streaming (client side) =================
+        // ================= Server-streaming (client high-level) =================
         template <class Req, class Resp, class OnMsg>
         usub::uvent::task::Awaitable<bool>
         server_streaming_by_name(std::string_view name, const Req& req, OnMsg on_msg, MetaOpts opts = {})
@@ -232,6 +232,140 @@ namespace urpc
             co_return true;
         }
 
+        // ================= Bidi-stream =================
+        struct Stream
+        {
+            uint32_t stream{};
+            uint64_t method{};
+            uint32_t in_credit{};
+            uint32_t out_credit{};
+            bool closed{};
+        };
+
+        usub::uvent::task::Awaitable<std::optional<Stream>>
+        stream_open(uint64_t method, uint32_t init_in_credit = 16, uint32_t init_out_credit = 16)
+        {
+            const uint32_t sid = next_stream_.fetch_add(1, std::memory_order_relaxed);
+
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::REQUEST);
+            h.flags = uint8_t(tr_.transport_bits() | F_FLOW_CREDIT);
+            h.stream = sid;
+            h.method = method;
+            h.codec = uint8_t(CodecKind::RAW);
+
+            std::string meta, body;
+            put_credit_meta(meta, init_in_credit);
+
+            std::string fr = make_frame(h, std::move(meta), std::move(body));
+            if (!(co_await tr_.send_frame(std::move(fr)))) co_return std::nullopt;
+
+            Stream s{sid, method, init_in_credit, init_out_credit, false};
+            co_return s;
+        }
+
+        usub::uvent::task::Awaitable<bool>
+        stream_send(Stream& s, std::string meta, std::string body, bool last)
+        {
+            while (s.out_credit == 0)
+                co_await usub::uvent::system::this_coroutine::sleep_for(std::chrono::microseconds(50));
+            --s.out_credit;
+
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::RESPONSE);
+            h.flags = tr_.transport_bits();
+            h.stream = s.stream;
+            h.method = s.method;
+            if (last) h.flags = uint8_t(h.flags | F_STREAM_LAST);
+
+            std::string fr = make_frame(h, std::move(meta), std::move(body));
+            bool ok = co_await tr_.send_frame(std::move(fr));
+            if (ok) co_await tr_.flush();
+            co_return ok;
+        }
+
+        usub::uvent::task::Awaitable<std::optional<ParsedFrame>>
+        stream_recv(Stream& s)
+        {
+            for (;;)
+            {
+                auto pf = co_await tr_.recv_frame();
+                if (!pf) co_return std::nullopt;
+
+                if (is_credit_frame(pf->h.flags) && pf->h.stream == s.stream && !pf->meta.empty())
+                {
+                    Buf mb{pf->meta};
+                    uint32_t delta{};
+                    if (get_credit_meta(mb, delta)) s.out_credit += delta;
+                    continue;
+                }
+
+                if (pf->h.stream != s.stream)
+                {
+                    push_inbox(std::move(*pf));
+                    continue;
+                }
+
+                if (pf->h.type == uint8_t(MsgType::ERROR)) co_return pf;
+                if (pf->h.type != uint8_t(MsgType::RESPONSE)) continue;
+
+                if (s.in_credit) --s.in_credit;
+                co_return pf;
+            }
+        }
+
+        usub::uvent::task::Awaitable<std::optional<ParsedFrame>>
+        stream_recv(Stream& s, uint32_t low_watermark, uint32_t refill)
+        {
+            for (;;)
+            {
+                auto pf = co_await tr_.recv_frame();
+                if (!pf) co_return std::nullopt;
+
+                if (is_credit_frame(pf->h.flags) && pf->h.stream == s.stream && !pf->meta.empty())
+                {
+                    Buf mb{pf->meta};
+                    uint32_t delta{};
+                    if (get_credit_meta(mb, delta)) s.out_credit += delta;
+                    continue;
+                }
+
+                if (pf->h.stream != s.stream)
+                {
+                    push_inbox(std::move(*pf));
+                    continue;
+                }
+
+                if (pf->h.type == uint8_t(MsgType::ERROR)) co_return pf;
+                if (pf->h.type != uint8_t(MsgType::RESPONSE)) continue;
+
+                if (s.in_credit) --s.in_credit;
+                if (s.in_credit <= low_watermark)
+                {
+                    s.in_credit += refill;
+                    (void)co_await stream_grant_credit(s, refill);
+                }
+                co_return pf;
+            }
+        }
+
+        usub::uvent::task::Awaitable<bool>
+        stream_grant_credit(Stream& s, uint32_t credit)
+        {
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::RESPONSE);
+            h.flags = uint8_t(tr_.transport_bits() | F_FLOW_CREDIT);
+            h.stream = s.stream;
+            h.method = s.method;
+            h.codec = uint8_t(CodecKind::RAW);
+
+            std::string meta, body;
+            put_credit_meta(meta, credit);
+
+            std::string fr = make_frame(h, std::move(meta), std::move(body));
+            co_return co_await tr_.send_frame(std::move(fr));
+        }
+
         // ================= Utilities =================
         usub::uvent::task::Awaitable<bool> ping()
         {
@@ -291,6 +425,17 @@ namespace urpc
         void clear_interceptors() { interceptors_.clear(); }
 
         [[nodiscard]] const std::optional<UrpcSettingsMeta>& peer_settings() const noexcept { return peer_settings_; }
+
+        usub::uvent::task::Awaitable<void> goaway(std::string_view reason)
+        {
+            (void)reason;
+            UrpcHdr h{};
+            h.type = uint8_t(MsgType::GOAWAY);
+            h.flags = uint8_t(tr_.transport_bits() | F_GOAWAY);
+            std::string fr = make_frame(h, {}, {});
+            (void)co_await tr_.send_frame(std::move(fr));
+            co_return;
+        }
 
     private:
         struct AwaitCV
@@ -380,8 +525,7 @@ namespace urpc
                 p->done = true;
                 p->cv.notify_one();
                 if (hooks_.on_recv)
-                    hooks_.on_recv(pf->h.method, pf->h.stream,
-                                   HDR_SIZE + p->meta.size() + p->body.size());
+                    hooks_.on_recv(pf->h.method, pf->h.stream, HDR_SIZE + p->meta.size() + p->body.size());
             }
             co_return;
         }
@@ -458,7 +602,6 @@ namespace urpc
         bool drop_oldest_{true};
     };
 
-    // helpers to build channels
     template <RWLike RW>
     inline Channel<RawTransport<RW>> make_raw_channel(RW rw)
     {

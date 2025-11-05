@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <iostream>
 #include <type_traits>
+#include <memory>
+#include <mutex>
 
 #include "Wire.h"
 #include "Codec.h"
@@ -18,7 +20,7 @@
 
 namespace urpc
 {
-    // ---------------- helpers: response/error headers ----------------
+    // helpers: response/error headers
     inline UrpcHdr make_response_for(const UrpcHdr& req)
     {
         UrpcHdr h{};
@@ -58,16 +60,36 @@ namespace urpc
     public:
         using Transport = T;
 
-        ServerRouter() = default;
+        // ===== Credit state (per stream) =====
+        struct CreditState
+        {
+            std::atomic<uint32_t> peer_in_credit{0};
+            struct CV
+            {
+                std::atomic<bool> ready{false};
 
-        // --------- unary (async) ----------
+                usub::uvent::task::Awaitable<void> wait()
+                {
+                    while (!ready.load(std::memory_order_acquire))
+                        co_await usub::uvent::system::this_coroutine::sleep_for(std::chrono::microseconds(50));
+                    ready.store(false, std::memory_order_release);
+                    co_return;
+                }
+
+                void notify() { ready.store(true, std::memory_order_release); }
+            } cv;
+        };
+
+        // unary (async)
         template <class Req, class Resp, class Fn>
         void register_unary(std::string name, Fn fn)
         {
             const uint64_t mid = method_id(name);
             std::cout << "[server] registered '" << name << "' id=" << mid << "\n";
-            handlers_[mid] = [fn = std::move(fn)](Transport& tr, ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
+            handlers_[mid] = [fn = std::move(fn), this](Transport& tr,
+                                                        ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
             {
+                if (pf.h.type == uint8_t(MsgType::CANCEL)) co_return; // ignore stray
                 Req req{};
                 Buf bb{pf.body};
                 if (!decode(bb, req))
@@ -93,14 +115,16 @@ namespace urpc
             };
         }
 
-        // --------- unary (sync handler) ----------
+        // unary (sync handler)
         template <class Req, class Resp, class Fn>
         void register_unary_sync(std::string name, Fn fn)
         {
             const uint64_t mid = method_id(name);
             std::cout << "[server] registered '" << name << "' id=" << mid << "\n";
-            handlers_[mid] = [fn = std::move(fn)](Transport& tr, ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
+            handlers_[mid] = [fn = std::move(fn), this](Transport& tr,
+                                                        ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
             {
+                if (pf.h.type == uint8_t(MsgType::CANCEL)) co_return;
                 Req req{};
                 Buf bb{pf.body};
                 if (!decode(bb, req))
@@ -129,14 +153,25 @@ namespace urpc
         class StreamWriter
         {
         public:
-            StreamWriter(Transport& tr, UrpcHdr base, uint64_t method, uint32_t stream)
-                : tr_(tr), base_(base), method_(method), stream_(stream)
+            StreamWriter(Transport& tr, UrpcHdr base, uint64_t method, uint32_t stream,
+                         std::shared_ptr<CreditState> cs)
+                : tr_(tr), base_(base), method_(method), stream_(stream), cs_(std::move(cs))
             {
             }
 
             template <class Resp>
             usub::uvent::task::Awaitable<bool> write(const Resp& item, bool last)
             {
+                for (;;)
+                {
+                    uint32_t c = cs_->peer_in_credit.load(std::memory_order_acquire);
+                    if (c > 0 && cs_->peer_in_credit.compare_exchange_weak(c, c - 1,
+                                                                           std::memory_order_acq_rel,
+                                                                           std::memory_order_relaxed))
+                        break;
+                    co_await cs_->cv.wait();
+                }
+
                 std::string meta_bin, body_bin;
                 encode(meta_bin, std::monostate{});
                 encode(body_bin, item);
@@ -159,18 +194,20 @@ namespace urpc
             UrpcHdr base_{};
             uint64_t method_{};
             uint32_t stream_{};
+            std::shared_ptr<CreditState> cs_;
         };
 
-        // ---------- server-streaming ----------
+        // server-streaming
         template <class Req, class Resp, class Fn>
         void register_server_streaming(std::string name, Fn fn)
         {
             const uint64_t mid = method_id(name);
             std::cout << "[server] registered '" << name << "' (srv-stream) id=" << mid << "\n";
 
-            handlers_[mid] = [fn = std::move(fn), mid](Transport& tr,
-                                                       ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
+            handlers_[mid] = [this, fn = std::move(fn), mid](Transport& tr,
+                                                             ParsedFrame pf) -> usub::uvent::task::Awaitable<void>
             {
+                if (pf.h.type == uint8_t(MsgType::CANCEL)) co_return;
                 Req req{};
                 Buf bb{pf.body};
                 if (!decode(bb, req))
@@ -183,26 +220,45 @@ namespace urpc
                     co_return;
                 }
 
-                StreamWriter w{tr, pf.h, mid, pf.h.stream};
+                std::shared_ptr<CreditState> cs;
+                {
+                    std::scoped_lock lk(cr_m_);
+                    auto& slot = credits_[pf.h.stream];
+                    if (!slot) slot = std::make_shared<CreditState>();
+                    cs = slot;
+                }
+                if (is_credit_frame(pf.h.flags) && !pf.meta.empty())
+                {
+                    uint32_t delta{};
+                    Buf mb{pf.meta};
+                    if (get_credit_meta(mb, delta))
+                    {
+                        cs->peer_in_credit.fetch_add(delta, std::memory_order_acq_rel);
+                        cs->cv.notify();
+                    }
+                }
+
+                StreamWriter w{tr, pf.h, mid, pf.h.stream, cs};
                 co_await fn(std::move(req), w);
+
+                {
+                    std::scoped_lock lk(cr_m_);
+                    credits_.erase(pf.h.stream);
+                }
                 co_return;
             };
         }
 
-        // ---------- serve_connection ----------
+        // serve_connection
         template <RWLike RW>
         usub::uvent::task::Awaitable<void> serve_connection(RW rw, TransportMode mode)
         {
             auto make_transport = [&]() -> Transport
             {
                 if constexpr (requires(RW a, TransportMode m) { Transport(std::move(a), m); })
-                {
                     return Transport(std::move(rw), mode);
-                }
                 else
-                {
                     return Transport(std::move(rw));
-                }
             };
 
             Transport tr = make_transport();
@@ -220,6 +276,29 @@ namespace urpc
                     (void)co_await tr.send_frame(std::move(fr));
                     co_await tr.flush();
                     continue;
+                }
+
+                if ((pf->h.flags & F_GOAWAY) != 0) break;
+
+                if (is_credit_frame(pf->h.flags) && !pf->meta.empty())
+                {
+                    uint32_t delta{};
+                    Buf mb{pf->meta};
+                    if (get_credit_meta(mb, delta))
+                    {
+                        std::shared_ptr<CreditState> cs;
+                        {
+                            std::scoped_lock lk(cr_m_);
+                            auto it = credits_.find(pf->h.stream);
+                            if (it != credits_.end()) cs = it->second;
+                        }
+                        if (cs)
+                        {
+                            cs->peer_in_credit.fetch_add(delta, std::memory_order_acq_rel);
+                            cs->cv.notify();
+                            continue;
+                        }
+                    }
                 }
 
                 auto it = handlers_.find(pf->h.method);
@@ -252,6 +331,9 @@ namespace urpc
     private:
         using Handler = std::function<usub::uvent::task::Awaitable<void>(Transport&, ParsedFrame)>;
         std::unordered_map<uint64_t, Handler> handlers_;
+
+        std::mutex cr_m_;
+        std::unordered_map<uint32_t, std::shared_ptr<CreditState>> credits_;
     };
 } // namespace urpc
 
