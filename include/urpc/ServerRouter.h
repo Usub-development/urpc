@@ -64,6 +64,7 @@ namespace urpc
         struct CreditState
         {
             std::atomic<uint32_t> peer_in_credit{0};
+
             struct CV
             {
                 std::atomic<bool> ready{false};
@@ -329,7 +330,7 @@ namespace urpc
         }
 
     private:
-        using Handler = std::function<usub::uvent::task::Awaitable<void>(Transport&, ParsedFrame)>;
+        using Handler = std::function<usub::uvent::task::Awaitable<void>(Transport &, ParsedFrame)>;
         std::unordered_map<uint64_t, Handler> handlers_;
 
         std::mutex cr_m_;

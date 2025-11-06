@@ -122,7 +122,7 @@ namespace urpc
         return true;
     }
 
-    // ===== flow-credit helpers (meta varuint) =====
+    // ===== flow-credit helpers =====
     inline void put_credit_meta(std::string& o, uint32_t delta) { put_varu(o, (uint64_t)delta); }
 
     inline bool get_credit_meta(Buf& b, uint32_t& delta)
@@ -174,7 +174,10 @@ namespace urpc
         return fnv1a64_fast(reinterpret_cast<const uint8_t*>(s.data()), s.size());
     }
 
-    // ===== zero-copy helpers for encode path =====
+    // ===== method id =====
+    inline uint64_t method_id(std::string_view name) { return fnv1a64_fast(name); }
+
+    // ===== zero-copy helpers for encode path (stubs) =====
     struct SpanBuf
     {
         std::span<const std::byte> view;
@@ -435,9 +438,6 @@ namespace urpc
             return ok;
         }
     }
-
-    // ===== method id =====
-    inline uint64_t method_id(std::string_view name) { return fnv1a64_fast(name); }
 } // namespace urpc
 
 #endif // URPC_CODEC_H

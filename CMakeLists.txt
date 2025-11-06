@@ -15,6 +15,7 @@ add_compile_definitions(DEV_STAGE=${DEV_STAGE})
 
 message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
 
+include(CTest)
 include(FetchContent)
 
 FetchContent_Declare(
@@ -65,15 +66,7 @@ if (URPC_BUILD_EXAMPLES)
     add_executable(urpc_example examples/main.cpp)
     target_link_libraries(urpc_example PRIVATE urpc)
     target_compile_definitions(urpc_example PRIVATE DEV_STAGE=${DEV_STAGE})
-
-    add_executable(urpc_example_ping_inbox examples/main_ping_inbox.cpp)
-    target_link_libraries(urpc_example_ping_inbox PRIVATE urpc)
-    target_compile_definitions(urpc_example_ping_inbox PRIVATE DEV_STAGE=${DEV_STAGE})
-
-    add_executable(urpc_example_interceptors examples/interceptor_demo.cpp)
-    target_link_libraries(urpc_example_interceptors PRIVATE urpc)
-    target_compile_definitions(urpc_example_interceptors PRIVATE DEV_STAGE=${DEV_STAGE})
-endif()
+endif ()
 
 install(TARGETS urpc
         EXPORT urpcTargets
@@ -114,3 +107,34 @@ install(EXPORT urpcTargets
         FILE urpcTargets.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/urpc
 )
+
+option(URPC_BUILD_TESTS "Build urpc tests" ON)
+if (BUILD_TESTING AND URPC_BUILD_TESTS)
+    # GoogleTest
+    FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG v1.15.2
+            FIND_PACKAGE_ARGS NAMES GTest
+    )
+    find_package(GTest QUIET)
+    if (NOT GTest_FOUND)
+        FetchContent_MakeAvailable(googletest)
+        set(GTest_LIBS GTest::gtest GTest::gtest_main)
+    else ()
+        set(GTest_LIBS GTest::gtest GTest::gtest_main)
+    endif ()
+
+    file(GLOB_RECURSE URPC_TESTS CONFIGURE_DEPENDS tests/*.cpp)
+
+    add_executable(urpc_tests ${URPC_TESTS})
+    target_link_libraries(urpc_tests PRIVATE urpc ${GTest_LIBS})
+    target_compile_definitions(urpc_tests PRIVATE DEV_STAGE=${DEV_STAGE})
+    target_compile_features(urpc_tests PRIVATE cxx_std_23)
+
+    include(GoogleTest)
+    gtest_discover_tests(urpc_tests
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            DISCOVERY_TIMEOUT 60
+    )
+endif ()

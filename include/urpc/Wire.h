@@ -7,14 +7,19 @@
 #include <string>
 #include <span>
 #include <array>
-#include <type_traits>
 #include <variant>
+#include <type_traits>
+#include <cstring>
 
 namespace urpc
 {
     // ===== protocol ids / versions =====
     inline constexpr uint16_t SPEC_MAGIC = 0x5552; // 'UR'
     inline constexpr uint8_t SPEC_VER = 1;
+
+    // ===== limits (frames/sections/varint) =====
+    inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024;
+    inline constexpr int MAX_VARINT_SHIFT = 63;
 
     // ===== message types =====
     enum class MsgType : uint8_t
@@ -55,6 +60,9 @@ namespace urpc
         F_GOAWAY = 1u << 6
     };
 
+    inline bool is_stream_last(uint8_t flags) { return flags_has(flags, F_STREAM_LAST); }
+    inline bool is_credit_frame(uint8_t flags) { return flags_has(flags, F_FLOW_CREDIT); }
+
     // ===== codec/compression kinds =====
     enum class CodecKind : uint8_t { RAW = 0, JSON = 1 };
 
@@ -93,7 +101,7 @@ namespace urpc
         return v;
     }
 
-    // ===== header =====
+    // ===== header  =====
 #pragma pack(push,1)
     struct UrpcHdr
     {
@@ -118,94 +126,27 @@ namespace urpc
     };
 #pragma pack(pop)
 
-    inline constexpr size_t HDR_NO_LEN =
-        (1 + 1 + 1 + 1) + // ver..rsv
-        4 + // stream
-        8 + // method
-        4 + // timeout
-        8 + // cancel
-        (1 + 1 + 2) + // codec, comp, spec
-        4 + 4; // meta, body
+    inline constexpr size_t WIRE_HDR_SIZE = 44;
+    inline constexpr size_t HDR_NO_LEN = WIRE_HDR_SIZE - 4;
+    inline constexpr size_t HDR_SIZE = WIRE_HDR_SIZE;
 
-    inline constexpr size_t HDR_SIZE = 4 + HDR_NO_LEN;
-    inline constexpr uint32_t MAX_FRAME_NO_LEN = 16 * 1024 * 1024;
-    inline constexpr int MAX_VARINT_SHIFT = 63;
-
-    // ===== encode/decode header =====
-    inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
+    enum class StatusCode : uint16_t
     {
-        out.reserve(out.size() + HDR_SIZE);
-        put_le32(out, h.len);
-        out.push_back(char(h.ver));
-        out.push_back(char(h.type));
-        out.push_back(char(h.flags));
-        out.push_back(char(h.rsv));
-        put_le32(out, h.stream);
-        put_le64(out, h.method);
-        put_le32(out, h.timeout_ms);
-        put_le64(out, h.cancel_id);
-        out.push_back(char(h.codec));
-        out.push_back(char(h.comp));
-        out.push_back(char(h.spec & 0xFF));
-        out.push_back(char((h.spec >> 8) & 0xFF));
-        put_le32(out, h.meta_len);
-        put_le32(out, h.body_len);
-    }
+        OK = 0, CANCELLED = 1, UNKNOWN = 2, INVALID_ARGUMENT = 3, DEADLINE_EXCEEDED = 4,
+        NOT_FOUND = 5, ALREADY_EXISTS = 6, PERMISSION_DENIED = 7, RESOURCE_EXHAUSTED = 8,
+        FAILED_PRECONDITION = 9, ABORTED = 10, OUT_OF_RANGE = 11, UNIMPLEMENTED = 12,
+        INTERNAL = 13, UNAVAILABLE = 14, DATA_LOSS = 15, UNAUTHENTICATED = 16,
+        PROTOCOL_ERROR = 1000, TRANSPORT_ERROR = 1001, WRONG_BODY = 1002
+    };
 
-    inline std::string hdr_encode(const UrpcHdr& h)
+    struct RpcError
     {
-        std::string out;
-        out.reserve(HDR_SIZE);
-        hdr_encode_into(out, h);
-        return out;
-    }
+        StatusCode code{};
+        std::string message;
+    };
 
-    [[nodiscard]] inline std::optional<UrpcHdr> hdr_decode(std::span<const std::byte> buf)
-    {
-        const size_t n = buf.size();
-        if (n < HDR_SIZE) return std::nullopt;
-
-        auto u8 = [&](size_t idx)-> uint8_t { return uint8_t(std::to_integer<unsigned char>(buf[idx])); };
-        auto ptr = [&](size_t idx)-> const char* { return reinterpret_cast<const char*>(buf.data() + idx); };
-
-        size_t i = 0;
-        UrpcHdr h{};
-        h.len = get_le32(ptr(i));
-        i += 4;
-        h.ver = u8(i++);
-        h.type = u8(i++);
-        h.flags = u8(i++);
-        h.rsv = u8(i++);
-        h.stream = get_le32(ptr(i));
-        i += 4;
-        h.method = get_le64(ptr(i));
-        i += 8;
-        h.timeout_ms = get_le32(ptr(i));
-        i += 4;
-        h.cancel_id = get_le64(ptr(i));
-        i += 8;
-        h.codec = u8(i++);
-        h.comp = u8(i++);
-        h.spec = uint16_t(uint8_t(ptr(i)[0]) | (uint16_t(uint8_t(ptr(i)[1])) << 8));
-        i += 2;
-        h.meta_len = get_le32(ptr(i));
-        i += 4;
-        h.body_len = get_le32(ptr(i));
-        i += 4;
-
-        const uint64_t expect = uint64_t(HDR_NO_LEN) + h.meta_len + h.body_len;
-        if (h.len != expect) return std::nullopt;
-        if (h.len < HDR_NO_LEN) return std::nullopt;
-        if (h.len > HDR_NO_LEN + MAX_FRAME_NO_LEN) return std::nullopt;
-        if (h.ver != SPEC_VER || h.spec != SPEC_MAGIC) return std::nullopt;
-        if (n < HDR_SIZE + h.meta_len + h.body_len) return std::nullopt;
-        return h;
-    }
-
-    [[nodiscard]] inline std::optional<UrpcHdr> hdr_decode(const char* p, size_t n)
-    {
-        return hdr_decode(std::span<const std::byte>(reinterpret_cast<const std::byte*>(p), n));
-    }
+    template <class T>
+    using RpcExpected = std::variant<T, RpcError>;
 
     // ===== frame =====
     struct ParsedFrame
@@ -215,34 +156,12 @@ namespace urpc
         std::string body;
     };
 
-    inline std::string make_frame(UrpcHdr h, std::string&& meta, std::string&& body)
+    inline size_t required_size(size_t meta, size_t body)
     {
-        h.meta_len = static_cast<uint32_t>(meta.size());
-        h.body_len = static_cast<uint32_t>(body.size());
-        h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
-
-        std::string out;
-        out.reserve(HDR_SIZE + h.meta_len + h.body_len);
-        hdr_encode_into(out, h);
-        out += meta;
-        out += body;
-        return out;
+        return WIRE_HDR_SIZE + meta + body;
     }
 
-    inline bool parse_frame(const char* p, size_t n, ParsedFrame& pf)
-    {
-        const auto hopt = hdr_decode(p, n);
-        if (!hopt) return false;
-
-        pf.h = *hopt;
-        const size_t meta_off = HDR_SIZE;
-        const size_t body_off = HDR_SIZE + pf.h.meta_len;
-        pf.meta.assign(p + meta_off, p + meta_off + pf.h.meta_len);
-        pf.body.assign(p + body_off, p + body_off + pf.h.body_len);
-        return true;
-    }
-
-    // ===== transport bits derive =====
+    // ===== settings/helpers =====
     inline uint8_t transport_bits_of(TransportMode m)
     {
         switch (m)
@@ -260,7 +179,6 @@ namespace urpc
         return flags_set_transport(base, transport_bits_of(m));
     }
 
-    // ===== settings / handshake helpers =====
     [[nodiscard]] inline UrpcHdr make_settings_hdr(TransportMode m)
     {
         UrpcHdr h{};
@@ -286,29 +204,6 @@ namespace urpc
         return transport_matches(is_tls, is_mtls, pf.h.flags);
     }
 
-    inline bool is_stream_last(uint8_t flags) { return flags_has(flags, F_STREAM_LAST); }
-    inline bool is_credit_frame(uint8_t flags) { return flags_has(flags, F_FLOW_CREDIT); }
-
-    // ===== status/error =====
-    enum class StatusCode : uint16_t
-    {
-        OK = 0, CANCELLED = 1, UNKNOWN = 2, INVALID_ARGUMENT = 3, DEADLINE_EXCEEDED = 4,
-        NOT_FOUND = 5, ALREADY_EXISTS = 6, PERMISSION_DENIED = 7, RESOURCE_EXHAUSTED = 8,
-        FAILED_PRECONDITION = 9, ABORTED = 10, OUT_OF_RANGE = 11, UNIMPLEMENTED = 12,
-        INTERNAL = 13, UNAVAILABLE = 14, DATA_LOSS = 15, UNAUTHENTICATED = 16,
-        PROTOCOL_ERROR = 1000, TRANSPORT_ERROR = 1001
-    };
-
-    struct RpcError
-    {
-        StatusCode code{};
-        std::string message;
-    };
-
-    template <class T>
-    using RpcExpected = std::variant<T, RpcError>;
-
-    // ===== ping/pong =====
     inline UrpcHdr make_ping(uint32_t stream = 0)
     {
         UrpcHdr h{};
@@ -324,6 +219,147 @@ namespace urpc
         h.stream = ping.stream;
         h.flags = ping.flags;
         return h;
+    }
+
+    // ===== encode/decode header & frame =====
+    inline void hdr_encode_into(std::string& out, const UrpcHdr& h)
+    {
+        out.reserve(out.size() + WIRE_HDR_SIZE);
+        put_le32(out, h.len);
+        out.push_back(char(h.ver));
+        out.push_back(char(h.type));
+        out.push_back(char(h.flags));
+        out.push_back(char(h.rsv));
+        put_le32(out, h.stream);
+        put_le64(out, h.method);
+        put_le32(out, h.timeout_ms);
+        put_le64(out, h.cancel_id);
+        out.push_back(char(h.codec));
+        out.push_back(char(h.comp));
+        out.push_back(char(h.spec & 0xFF));
+        out.push_back(char((h.spec >> 8) & 0xFF));
+        put_le32(out, h.meta_len);
+        put_le32(out, h.body_len);
+    }
+
+    inline std::string make_frame(UrpcHdr h, std::string&& meta, std::string&& body)
+    {
+        h.meta_len = static_cast<uint32_t>(meta.size());
+        h.body_len = static_cast<uint32_t>(body.size());
+        h.len = static_cast<uint32_t>(HDR_NO_LEN + h.meta_len + h.body_len);
+
+        std::string out;
+        out.reserve(WIRE_HDR_SIZE + h.meta_len + h.body_len);
+        hdr_encode_into(out, h);
+        out += meta;
+        out += body;
+        return out;
+    }
+
+    inline bool parse_frame(const char* p, size_t n, ParsedFrame& pf)
+    {
+        if (n < WIRE_HDR_SIZE) return false;
+
+        size_t i = 0;
+        UrpcHdr h{};
+        h.len = get_le32(p + i);
+        i += 4;
+        h.ver = uint8_t(p[i++]);
+        h.type = uint8_t(p[i++]);
+        h.flags = uint8_t(p[i++]);
+        h.rsv = uint8_t(p[i++]);
+        h.stream = get_le32(p + i);
+        i += 4;
+        h.method = get_le64(p + i);
+        i += 8;
+        h.timeout_ms = get_le32(p + i);
+        i += 4;
+        h.cancel_id = get_le64(p + i);
+        i += 8;
+        h.codec = uint8_t(p[i++]);
+        h.comp = uint8_t(p[i++]);
+        h.spec = uint16_t(uint8_t(p[i]) | (uint16_t(uint8_t(p[i + 1])) << 8));
+        i += 2;
+        h.meta_len = get_le32(p + i);
+        i += 4;
+        h.body_len = get_le32(p + i);
+        i += 4;
+
+        const uint64_t expect_len = uint64_t(HDR_NO_LEN) + h.meta_len + h.body_len;
+        if (h.len != expect_len || h.len < HDR_NO_LEN) return false;
+        if (h.ver != SPEC_VER || h.spec != SPEC_MAGIC) return false;
+        if (n < WIRE_HDR_SIZE + h.meta_len + h.body_len) return false;
+
+        pf.h = h;
+        const size_t meta_off = WIRE_HDR_SIZE;
+        const size_t body_off = WIRE_HDR_SIZE + pf.h.meta_len;
+        pf.meta.assign(p + meta_off, p + meta_off + pf.h.meta_len);
+        pf.body.assign(p + body_off, p + body_off + pf.h.body_len);
+        return true;
+    }
+
+    inline RpcExpected<UrpcHdr> decode_header(std::span<const std::byte> s)
+    {
+        if (s.size() < WIRE_HDR_SIZE)
+            return RpcError{StatusCode::WRONG_BODY, "Body is too small"};
+
+        const uint8_t* u = reinterpret_cast<const uint8_t*>(s.data());
+        size_t i = 0;
+
+        UrpcHdr h{};
+        h.len = get_le32(reinterpret_cast<const char*>(u + i));
+        i += 4;
+        h.ver = u[i++];
+        h.type = u[i++];
+        h.flags = u[i++];
+        h.rsv = u[i++];
+        h.stream = get_le32(reinterpret_cast<const char*>(u + i));
+        i += 4;
+        h.method = get_le64(reinterpret_cast<const char*>(u + i));
+        i += 8;
+        h.timeout_ms = get_le32(reinterpret_cast<const char*>(u + i));
+        i += 4;
+        h.cancel_id = get_le64(reinterpret_cast<const char*>(u + i));
+        i += 8;
+        h.codec = u[i++];
+        h.comp = u[i++];
+        h.spec = uint16_t(uint8_t(u[i]) | (uint16_t(uint8_t(u[i + 1])) << 8));
+        i += 2;
+        h.meta_len = get_le32(reinterpret_cast<const char*>(u + i));
+        i += 4;
+        h.body_len = get_le32(reinterpret_cast<const char*>(u + i));
+        i += 4;
+
+        if (h.spec != SPEC_MAGIC) return RpcError{StatusCode::PROTOCOL_ERROR, "Bad magic"};
+        if (h.ver != SPEC_VER) return RpcError{StatusCode::PROTOCOL_ERROR, "Version mismatch"};
+
+        const uint64_t expect_len = uint64_t(HDR_NO_LEN) + h.meta_len + h.body_len;
+        if (h.len != expect_len || h.len < HDR_NO_LEN)
+            return RpcError{StatusCode::PROTOCOL_ERROR, "Length mismatch"};
+
+        if (h.meta_len > MAX_FRAME_NO_LEN || h.body_len > MAX_FRAME_NO_LEN)
+            return RpcError{StatusCode::RESOURCE_EXHAUSTED, "Section too large"};
+
+        return h;
+    }
+
+    namespace detail
+    {
+        template <class Buf>
+        concept DynBufLike = requires(Buf& b)
+        {
+            { b.data() } -> std::convertible_to<const char*>;
+            { b.size() } -> std::convertible_to<size_t>;
+        };
+    }
+
+    template <detail::DynBufLike DynBuf>
+    inline RpcExpected<UrpcHdr> decode_header(DynBuf& buf)
+    {
+        std::span<const std::byte> s{
+            reinterpret_cast<const std::byte*>(buf.data()), buf.size()
+        };
+        return decode_header(s);
     }
 } // namespace urpc
 

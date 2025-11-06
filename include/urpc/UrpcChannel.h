@@ -214,8 +214,7 @@ namespace urpc
                     if (hooks_.on_error) hooks_.on_error(StatusCode::UNKNOWN);
                     co_return false;
                 }
-                if (pf0->h.type != uint8_t(MsgType::RESPONSE))
-                    continue;
+                if (pf0->h.type != uint8_t(MsgType::RESPONSE)) continue;
 
                 Resp item{};
                 {

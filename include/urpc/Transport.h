@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <utility>
 #include <concepts>
-#include <iostream>
 #include <chrono>
 
 #include "Wire.h"
@@ -90,7 +89,7 @@ namespace urpc
             t.close();
         };
 
-
+    // ===== IO helpers =====
     template <RWLike RW>
     usub::uvent::task::Awaitable<bool> read_exact_into(RW& rw, std::string& dst, size_t need)
     {
@@ -110,29 +109,24 @@ namespace urpc
         co_return true;
     }
 
+    // ===== recv: header then full frame =====
     template <RWLike RW>
     usub::uvent::task::Awaitable<std::optional<UrpcHdr>>
     recv_header(RW& rw, Framer& fr)
     {
-        while (fr.rx.size() < HDR_SIZE)
+        // ensure header is present
+        while (fr.rx.size() < WIRE_HDR_SIZE)
         {
-            const auto need = HDR_SIZE - fr.rx.size();
+            const size_t need = WIRE_HDR_SIZE - fr.rx.size();
             if (!(co_await read_exact_into(rw, fr.rx, need))) co_return std::nullopt;
         }
-        auto hopt = hdr_decode(
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(fr.rx.data()), fr.rx.size()));
-        if (hopt) co_return hopt;
 
-        const uint32_t len_field = get_le32(fr.rx.data());
-        if (len_field > MAX_FRAME_NO_LEN + HDR_NO_LEN) co_return std::nullopt;
-        const size_t total_need = 4 + (size_t)len_field;
-        const size_t now = fr.rx.size();
-        if (now < total_need)
-        {
-            if (!(co_await read_exact_into(rw, fr.rx, total_need - now))) co_return std::nullopt;
-        }
-        co_return hdr_decode(
-            std::span<const std::byte>(reinterpret_cast<const std::byte*>(fr.rx.data()), fr.rx.size()));
+        // decode header from the first 44 bytes
+        auto hres = decode_header(
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(fr.rx.data()), WIRE_HDR_SIZE));
+        if (std::holds_alternative<RpcError>(hres)) co_return std::nullopt;
+
+        co_return std::get<UrpcHdr>(hres);
     }
 
     template <RWLike RW>
@@ -143,7 +137,7 @@ namespace urpc
         if (!hopt) co_return std::nullopt;
 
         const UrpcHdr h = *hopt;
-        const size_t total = 4 + (size_t)h.len;
+        const size_t total = WIRE_HDR_SIZE + size_t(h.meta_len) + size_t(h.body_len);
 
         if (fr.rx.size() < total)
         {
@@ -233,7 +227,10 @@ namespace urpc
     {
     public:
         explicit TlsTransport(RW rw, TransportMode mode = TransportMode::TLS, int native = -1)
-            : rw_(std::move(rw)), native_(native) { fr_.transport_bits = derive_transport_flags(mode); }
+            : rw_(std::move(rw)), native_(native)
+        {
+            fr_.transport_bits = derive_transport_flags(mode);
+        }
 
         uint8_t transport_bits() const noexcept override { return fr_.transport_bits; }
         bool alive() const noexcept override { return alive_; }
