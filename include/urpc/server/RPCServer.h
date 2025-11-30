@@ -34,9 +34,11 @@ namespace urpc
         template <uint64_t MethodId, typename F>
         void register_method_ct(F&& f)
         {
+#if URPC_LOGS
             usub::ulog::debug(
                 "RpcServer: register_method_ct MethodId={}",
                 MethodId);
+#endif
             this->registry_.register_method_ct<MethodId>(
                 std::forward<F>(f));
         }

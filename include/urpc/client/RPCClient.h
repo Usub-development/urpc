@@ -53,7 +53,9 @@ namespace urpc
             std::span<const uint8_t> request_body)
         {
             uint64_t mid = fnv1a64_rt(std::string_view{name, N - 1});
+#if URPC_LOGS
             usub::ulog::debug("RpcClient::async_call(name): name={} hash={}", name, mid);
+#endif
             co_return co_await async_call(mid, request_body);
         }
 
@@ -61,7 +63,9 @@ namespace urpc
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call_ct(
             std::span<const uint8_t> request_body)
         {
+#if URPC_LOGS
             usub::ulog::debug("RpcClient::async_call_ct: MethodId={}", MethodId);
+#endif
             co_return co_await async_call(MethodId, request_body);
         }
 
