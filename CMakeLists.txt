@@ -91,6 +91,18 @@ if (URPC_BUILD_EXAMPLES)
     add_executable(urpc_stress_client examples/main_client_stress.cpp)
     target_link_libraries(urpc_stress_client PRIVATE urpc)
     target_compile_definitions(urpc_stress_client PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_multi examples/main_server_multi.cpp)
+    target_link_libraries(urpc_example_multi PRIVATE urpc)
+    target_compile_definitions(urpc_example_multi PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_client_multi examples/main_multi_methods_single_client.cpp)
+    target_link_libraries(urpc_example_client_multi PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_multi PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_stress_client_multi examples/main_multi_methods_stress.cpp)
+    target_link_libraries(urpc_stress_client_multi PRIVATE urpc)
+    target_compile_definitions(urpc_stress_client_multi PRIVATE DEV_STAGE=${DEV_STAGE})
 endif ()
 
 install(TARGETS urpc
