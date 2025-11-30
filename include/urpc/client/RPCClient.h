@@ -38,7 +38,7 @@ namespace urpc
         std::string error_message;
     };
 
-    class RpcClient
+    class RpcClient : public std::enable_shared_from_this<RpcClient>
     {
     public:
         RpcClient(std::string host, uint16_t port);
@@ -53,16 +53,24 @@ namespace urpc
             std::span<const uint8_t> request_body)
         {
             uint64_t mid = fnv1a64_rt(std::string_view{name, N - 1});
-            usub::ulog::debug("RpcClient::async_call(name): name={} hash={}", name, mid);
-            co_return co_await async_call(mid, request_body);
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call(name): name={} hash={}",
+                name, mid);
+#endif
+            co_return co_await this->async_call(mid, request_body);
         }
 
         template <uint64_t MethodId>
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call_ct(
             std::span<const uint8_t> request_body)
         {
-            usub::ulog::debug("RpcClient::async_call_ct: MethodId={}", MethodId);
-            co_return co_await async_call(MethodId, request_body);
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call_ct: MethodId={}",
+                MethodId);
+#endif
+            co_return co_await this->async_call(MethodId, request_body);
         }
 
         usub::uvent::task::Awaitable<bool> async_ping();
@@ -90,9 +98,12 @@ namespace urpc
         usub::uvent::task::Awaitable<bool> ensure_connected();
         usub::uvent::task::Awaitable<void> reader_loop();
 
+        static usub::uvent::task::Awaitable<void> run_reader_detached(
+            std::shared_ptr<RpcClient> self);
+
         bool parse_error_payload(const usub::uvent::utils::DynamicBuffer& payload,
-                                            uint32_t& out_code,
-                                            std::string& out_msg) const;
+                                 uint32_t& out_code,
+                                 std::string& out_msg) const;
     };
 }
 

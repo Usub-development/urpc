@@ -63,7 +63,7 @@ namespace urpc
         usub::uvent::sync::AsyncMutex write_mutex_;
         usub::uvent::sync::AsyncMutex cancel_map_mutex_;
         std::unordered_map<
-            uint32_t,
+            uint64_t,
             std::shared_ptr<usub::uvent::sync::CancellationSource>> cancel_map_;
     };
 }

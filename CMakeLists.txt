@@ -11,6 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 
+option(URPC_LOGS "Use URPC_LOGS" ON)
+
 add_compile_definitions(DEV_STAGE=${DEV_STAGE})
 
 message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
@@ -28,13 +30,7 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/Usub-development/ureflect.git
         GIT_TAG main
 )
-FetchContent_Declare(
-        ulog
-        GIT_REPOSITORY https://github.com/Usub-development/ulog.git
-        GIT_TAG main
-)
-
-FetchContent_MakeAvailable(uvent ureflect ulog)
+FetchContent_MakeAvailable(uvent ureflect)
 
 file(GLOB_RECURSE URPC_HEADERS CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/include/urpc/*.h
@@ -57,7 +53,23 @@ target_link_libraries(urpc
         PUBLIC
         usub::uvent
         usub::ureflect
-        usub::ulog
+)
+
+if (URPC_LOGS)
+    FetchContent_Declare(
+            ulog
+            GIT_REPOSITORY https://github.com/Usub-development/ulog.git
+            GIT_TAG main
+    )
+    FetchContent_MakeAvailable(ulog)
+    target_link_libraries(urpc
+            PUBLIC
+            usub::ulog
+    )
+endif ()
+
+target_compile_definitions(urpc PUBLIC
+        $<$<BOOL:${URPC_LOGS}>:URPC_LOGS>
 )
 
 set_target_properties(urpc PROPERTIES
@@ -75,6 +87,10 @@ if (URPC_BUILD_EXAMPLES)
     add_executable(urpc_example_client examples/main_client.cpp)
     target_link_libraries(urpc_example_client PRIVATE urpc)
     target_compile_definitions(urpc_example_client PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_stress_client examples/main_client_stress.cpp)
+    target_link_libraries(urpc_stress_client PRIVATE urpc)
+    target_compile_definitions(urpc_stress_client PRIVATE DEV_STAGE=${DEV_STAGE})
 endif ()
 
 install(TARGETS urpc
