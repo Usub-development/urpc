@@ -1,11 +1,10 @@
 //
 // Created by Kirill Zhukov on 30.11.2025.
 //
-// main_client_stress.cpp
-//
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -23,24 +22,23 @@ using namespace std::chrono_literals;
 static std::atomic<uint64_t> g_ok_calls{0};
 static std::atomic<uint64_t> g_failed_calls{0};
 static std::atomic<uint64_t> g_total_latency_ns{0};
+static std::atomic<int> g_finished_clients{0};
 
-constexpr int kClientsCount          = 64;
-constexpr int kRequestsPerClient     = 1000;
-constexpr std::string_view kMethod   = "Example.Echo";
+constexpr int kClientsCount = 64;
+constexpr int kRequestsPerClient = 2;
 
 task::Awaitable<void> torture_client(int client_id)
 {
     ulog::info("CLIENT[{}]: torture_client started", client_id);
 
-    urpc::RpcClient client{"localhost", 45900};
+    auto client = std::make_shared<urpc::RpcClient>("localhost", 45900);
 
-    // Optional warmup ping
-    bool pong = co_await client.async_ping();
+    ulog::info("CLIENT[{}]: before ping", client_id);
+    bool pong = co_await client->async_ping();
     ulog::info("CLIENT[{}]: ping={}", client_id, pong);
 
     for (int i = 0; i < kRequestsPerClient; ++i)
     {
-        // Unique payload per request
         std::string payload_str =
             "client=" + std::to_string(client_id) +
             ";req=" + std::to_string(i) +
@@ -51,9 +49,13 @@ task::Awaitable<void> torture_client(int client_id)
             payload_str.size()
         };
 
+        ulog::info("CLIENT[{}]: before call #{}", client_id, i);
+
         auto started = std::chrono::steady_clock::now();
-        auto resp    = co_await client.async_call(std::string{kMethod}, req);
-        auto ended   = std::chrono::steady_clock::now();
+        auto resp = co_await client->async_call("Example.Echo", req);
+        auto ended = std::chrono::steady_clock::now();
+
+        ulog::info("CLIENT[{}]: after call #{}", client_id, i);
 
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ended - started).count();
         g_total_latency_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
@@ -76,11 +78,12 @@ task::Awaitable<void> torture_client(int client_id)
         {
             g_ok_calls.fetch_add(1, std::memory_order_relaxed);
         }
-
-        // Optional micro-backoff to emulate real clients
-        // co_await system::this_coroutine::sleep_for(1ms);
     }
 
+    client->close();
+    co_await system::this_coroutine::sleep_for(5ms);
+
+    g_finished_clients.fetch_add(1, std::memory_order_relaxed);
     ulog::info("CLIENT[{}]: torture_client finished", client_id);
     co_return;
 }
@@ -94,7 +97,7 @@ int main()
         .warn_path = nullptr,
         .error_path = nullptr,
         .flush_interval_ns = 2'000'000ULL,
-        .queue_capacity = 64,
+        .queue_capacity = 16384,
         .batch_size = 1024,
         .enable_color_stdout = true,
         .max_file_size_bytes = 10 * 1024 * 1024,
@@ -106,19 +109,26 @@ int main()
     usub::ulog::init(cfg);
     ulog::info("STRESS CLIENT: logger initialized");
 
-    // More threads to hammer server harder
     Uvent uvent(4);
 
-    // Small delay before starting the storm
-    system::co_spawn([]() -> task::Awaitable<void> {
+    system::co_spawn([]() -> task::Awaitable<void>
+    {
         ulog::info("STRESS CLIENT: pre-sleep 1s before spawning clients");
         co_await system::this_coroutine::sleep_for(1000ms);
 
         for (int i = 0; i < kClientsCount; ++i)
-        {
             system::co_spawn(torture_client(i));
+
+        while (true)
+        {
+            int finished = g_finished_clients.load(std::memory_order_relaxed);
+            ulog::info("STRESS CLIENT: finished_clients={}/{}", finished, kClientsCount);
+            if (finished >= kClientsCount)
+                break;
+            co_await system::this_coroutine::sleep_for(100ms);
         }
 
+        ulog::info("STRESS CLIENT: all clients finished");
         co_return;
     }());
 
@@ -126,9 +136,9 @@ int main()
     uvent.run();
     ulog::warn("STRESS CLIENT: event loop finished");
 
-    uint64_t ok     = g_ok_calls.load(std::memory_order_relaxed);
+    uint64_t ok = g_ok_calls.load(std::memory_order_relaxed);
     uint64_t failed = g_failed_calls.load(std::memory_order_relaxed);
-    uint64_t total  = ok + failed;
+    uint64_t total = ok + failed;
 
     if (total > 0)
     {

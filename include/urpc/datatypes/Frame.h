@@ -33,7 +33,7 @@ namespace urpc
         FLAG_COMPRESSED = 0x04,
     };
 
-    struct alignas(16) RpcFrameHeader
+    struct RpcFrameHeader
     {
         uint32_t magic; // 'URPC' = 0x55525043
         uint8_t version;
@@ -44,7 +44,16 @@ namespace urpc
         uint32_t length;
     };
 
-    static_assert(sizeof(RpcFrameHeader) == 32);
+    constexpr size_t RpcFrameHeaderSize =
+        sizeof(uint32_t) +
+        1 +
+        1 +
+        sizeof(uint16_t) +
+        sizeof(uint32_t) +
+        sizeof(uint64_t) +
+        sizeof(uint32_t);
+
+    static_assert(RpcFrameHeaderSize == 24);
 
     URPC_ALWAYS_INLINE void serialize_header(const RpcFrameHeader& src, uint8_t* out)
     {

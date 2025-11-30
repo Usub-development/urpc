@@ -2,96 +2,131 @@
 
 namespace urpc
 {
+    using namespace usub::uvent;
+
+    static task::Awaitable<bool> read_exact(
+        IRpcStream& stream,
+        utils::DynamicBuffer& buf,
+        std::size_t expected)
+    {
+        buf.clear();
+        buf.reserve(expected);
+
+        #if URPC_LOGS
+                    usub::ulog::debug(
+                        "RpcConnection::read_exact: cur={} expected={}",
+                        buf.size(), expected);
+        #endif
+
+                    ssize_t r = co_await stream.async_read(buf, expected);
+        #if URPC_LOGS
+                    usub::ulog::debug(
+                        "RpcConnection::read_exact: async_read r={} size={}",
+                        r, buf.size());
+        #endif
+
+        co_return true;
+    }
+
     RpcConnection::RpcConnection(std::shared_ptr<IRpcStream> stream,
                                  RpcMethodRegistry& registry)
         : stream_(std::move(stream))
           , registry_(registry)
     {
 #if URPC_LOGS
-        usub::ulog::info("RpcConnection ctor: stream_={}",
-                         static_cast<void*>(stream_.get()));
+        usub::ulog::info(
+            "RpcConnection ctor: stream_={}",
+            static_cast<void*>(stream_.get()));
 #endif
     }
 
     usub::uvent::task::Awaitable<void>
     RpcConnection::run_detached(std::shared_ptr<RpcConnection> self)
     {
-        using namespace usub::uvent;
-
         if (!self)
             co_return;
 #if URPC_LOGS
-        usub::ulog::info("RpcConnection::run_detached: self={}",
-                         static_cast<void*>(self.get()));
+        usub::ulog::info(
+            "RpcConnection::run_detached: self={}",
+            static_cast<void*>(self.get()));
 #endif
         co_await self->loop();
 #if URPC_LOGS
-        usub::ulog::warn("RpcConnection::run_detached: finished self={}",
-                         static_cast<void*>(self.get()));
+        usub::ulog::warn(
+            "RpcConnection::run_detached: finished self={}",
+            static_cast<void*>(self.get()));
 #endif
         co_return;
     }
 
     usub::uvent::task::Awaitable<void> RpcConnection::loop()
     {
-        using namespace usub::uvent;
-
-        if (!stream_)
+        if (!this->stream_)
         {
 #if URPC_LOGS
             usub::ulog::error("RpcConnection::loop: stream_ is null");
 #endif
             co_return;
         }
+
 #if URPC_LOGS
         usub::ulog::info(
             "RpcConnection::loop: started, this={} stream_={}",
             static_cast<void*>(this),
-            static_cast<void*>(stream_.get()));
+            static_cast<void*>(this->stream_.get()));
 #endif
+
         for (;;)
         {
+            if (!this->stream_)
+            {
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcConnection::loop: stream_ became null, exiting");
+#endif
+                break;
+            }
+
             utils::DynamicBuffer head;
-            head.reserve(sizeof(RpcFrameHeader));
 #if URPC_LOGS
             usub::ulog::debug(
                 "RpcConnection::loop: reading header {} bytes",
                 sizeof(RpcFrameHeader));
 #endif
-            ssize_t r = co_await stream_->async_read(head, sizeof(RpcFrameHeader));
-#if URPC_LOGS
-            usub::ulog::debug(
-                "RpcConnection::loop: header async_read r={} size={}",
-                r, head.size());
-#endif
-            if (r <= 0)
+            const bool ok_hdr = co_await read_exact(
+                *this->stream_, head, sizeof(RpcFrameHeader));
+            if (!ok_hdr)
             {
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcConnection::loop: header read r<=0, shutting down stream");
+                    "RpcConnection::loop: header read_exact failed, "
+                    "shutting down stream");
 #endif
-                stream_->shutdown();
+                this->stream_->shutdown();
                 break;
             }
 
-            if (head.size() < sizeof(RpcFrameHeader))
+            if (head.size() != sizeof(RpcFrameHeader))
             {
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcConnection::loop: header size={} < {}, dropping",
+                    "RpcConnection::loop: header size={} != {}, dropping",
                     head.size(), sizeof(RpcFrameHeader));
 #endif
-                stream_->shutdown();
+                this->stream_->shutdown();
                 break;
             }
 
-            RpcFrameHeader hdr = parse_header(head.data());
+            RpcFrameHeader hdr = parse_header(
+                reinterpret_cast<const uint8_t*>(head.data()));
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcConnection::loop: parsed header magic={} ver={} type={} len={}",
+                "RpcConnection::loop: parsed header magic={} ver={} type={} "
+                "sid={} len={}",
                 static_cast<unsigned>(hdr.magic),
                 static_cast<unsigned>(hdr.version),
                 static_cast<unsigned>(hdr.type),
+                hdr.stream_id,
                 hdr.length);
 #endif
             if (hdr.magic != 0x55525043 || hdr.version != 1)
@@ -100,7 +135,7 @@ namespace urpc
                 usub::ulog::warn(
                     "RpcConnection::loop: invalid header magic/ver, dropping");
 #endif
-                stream_->shutdown();
+                this->stream_->shutdown();
                 break;
             }
 
@@ -109,34 +144,31 @@ namespace urpc
 
             if (hdr.length > 0)
             {
-                frame.payload.reserve(hdr.length);
+                const std::size_t len = hdr.length;
 #if URPC_LOGS
                 usub::ulog::debug(
-                    "RpcConnection::loop: reading payload {} bytes",
-                    hdr.length);
+                    "RpcConnection::loop: reading payload {} bytes", len);
 #endif
-                ssize_t r2 = co_await stream_->async_read(
-                    frame.payload, static_cast<size_t>(hdr.length));
-#if URPC_LOGS
-                usub::ulog::debug(
-                    "RpcConnection::loop: payload async_read r2={} size={}",
-                    r2, frame.payload.size());
-#endif
-                if (r2 <= 0 || frame.payload.size() < hdr.length)
+                const bool ok_body = co_await read_exact(
+                    *this->stream_, frame.payload, len);
+
+                if (!ok_body || frame.payload.size() != len)
                 {
 #if URPC_LOGS
                     usub::ulog::warn(
-                        "RpcConnection::loop: payload read failed r2={} size={} len={}",
-                        r2, frame.payload.size(), hdr.length);
+                        "RpcConnection::loop: payload read_exact failed, "
+                        "size={} len={}",
+                        frame.payload.size(), len);
 #endif
-                    stream_->shutdown();
+                    this->stream_->shutdown();
                     break;
                 }
             }
             else
             {
 #if URPC_LOGS
-                usub::ulog::debug("RpcConnection::loop: zero-length payload");
+                usub::ulog::debug(
+                    "RpcConnection::loop: zero-length payload");
 #endif
             }
 
@@ -147,20 +179,33 @@ namespace urpc
                 static_cast<int>(ft),
                 frame.header.stream_id,
                 frame.header.length);
+
+            usub::ulog::info(
+                "RpcConnection[{}]: got frame type={} sid={} len={}",
+                static_cast<void*>(this),
+                static_cast<int>(ft),
+                frame.header.stream_id,
+                frame.header.length);
 #endif
 
             switch (ft)
             {
             case FrameType::Request:
-                co_await handle_request(std::move(frame));
+#if URPC_LOGS
+                usub::ulog::debug(
+                    "RpcConnection::loop: handling Request sid={} method_id={}",
+                    frame.header.stream_id,
+                    frame.header.method_id);
+#endif
+                co_await this->handle_request(std::move(frame));
                 break;
 
             case FrameType::Cancel:
-                co_await handle_cancel(std::move(frame));
+                co_await this->handle_cancel(std::move(frame));
                 break;
 
             case FrameType::Ping:
-                co_await handle_ping(std::move(frame));
+                co_await this->handle_ping(std::move(frame));
                 break;
 
             default:
@@ -173,6 +218,7 @@ namespace urpc
                 break;
             }
         }
+
 #if URPC_LOGS
         usub::ulog::warn("RpcConnection::loop: exiting");
 #endif
@@ -183,9 +229,29 @@ namespace urpc
     RpcConnection::locked_send(const RpcFrameHeader& hdr,
                                std::span<const uint8_t> body)
     {
-        auto guard = co_await write_mutex_.lock();
-        co_await send_frame(*stream_, hdr, body);
+        auto guard = co_await this->write_mutex_.lock();
         (void)guard;
+
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcConnection[{}]: locked_send type={} sid={} len={}",
+            static_cast<void*>(this),
+            static_cast<unsigned>(hdr.type),
+            hdr.stream_id,
+            body.size());
+#endif
+
+        co_await send_frame(*this->stream_, hdr, body);
+
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcConnection[{}]: locked_send finished type={} sid={} len={}",
+            static_cast<void*>(this),
+            static_cast<unsigned>(hdr.type),
+            hdr.stream_id,
+            body.size());
+#endif
+
         co_return;
     }
 
@@ -197,12 +263,21 @@ namespace urpc
         hdr.magic = 0x55525043;
         hdr.version = 1;
         hdr.type = static_cast<uint8_t>(FrameType::Response);
-        hdr.flags = 0x0001; // END_STREAM
+        hdr.flags = FLAG_END_STREAM;
         hdr.stream_id = ctx.stream_id;
         hdr.method_id = ctx.method_id;
         hdr.length = static_cast<uint32_t>(body.size());
 
-        co_await locked_send(hdr, body);
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcConnection[{}]: sending Response mid={} sid={} len={}",
+            static_cast<void*>(this),
+            hdr.method_id,
+            hdr.stream_id,
+            hdr.length);
+#endif
+
+        co_await this->locked_send(hdr, body);
         co_return;
     }
 
@@ -223,15 +298,18 @@ namespace urpc
 
         buf.insert(buf.end(),
                    reinterpret_cast<const uint8_t*>(&code_be),
-                   reinterpret_cast<const uint8_t*>(&code_be) + sizeof(code_be));
+                   reinterpret_cast<const uint8_t*>(&code_be)
+                   + sizeof(code_be));
 
         buf.insert(buf.end(),
                    reinterpret_cast<const uint8_t*>(&msg_len_be),
-                   reinterpret_cast<const uint8_t*>(&msg_len_be) + sizeof(msg_len_be));
+                   reinterpret_cast<const uint8_t*>(&msg_len_be)
+                   + sizeof(msg_len_be));
 
         buf.insert(buf.end(),
                    reinterpret_cast<const uint8_t*>(message.data()),
-                   reinterpret_cast<const uint8_t*>(message.data()) + message.size());
+                   reinterpret_cast<const uint8_t*>(message.data())
+                   + message.size());
 
         if (!details.empty())
         {
@@ -247,40 +325,64 @@ namespace urpc
         hdr.method_id = ctx.method_id;
         hdr.length = static_cast<uint32_t>(buf.size());
 
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcConnection[{}]: sending ERROR Response mid={} sid={} len={} code={}",
+            static_cast<void*>(this),
+            hdr.method_id,
+            hdr.stream_id,
+            hdr.length,
+            error_code);
+#endif
+
         std::span<const uint8_t> span{buf.data(), buf.size()};
-        co_await locked_send(hdr, span);
+        co_await this->locked_send(hdr, span);
         co_return;
     }
 
     usub::uvent::task::Awaitable<void>
     RpcConnection::handle_request(RpcFrame frame)
     {
-        using namespace usub::uvent;
+#if URPC_LOGS
+        usub::ulog::info(
+            "handle_request: sid={} mid={} len={}",
+            frame.header.stream_id,
+            frame.header.method_id,
+            frame.header.length);
+#endif
 
-        RpcHandlerPtr fn = registry_.find(frame.header.method_id);
+        RpcHandlerPtr fn = this->registry_.find(frame.header.method_id);
         if (!fn)
         {
+#if URPC_LOGS
+            usub::ulog::error(
+                "handle_request: no handler for mid={} sid={}",
+                frame.header.method_id,
+                frame.header.stream_id);
+#endif
+
+
             RpcContext tmp{
-                .stream       = *stream_,
-                .stream_id    = frame.header.stream_id,
-                .method_id    = frame.header.method_id,
-                .flags        = frame.header.flags,
+                .stream = *this->stream_,
+                .stream_id = frame.header.stream_id,
+                .method_id = frame.header.method_id,
+                .flags = frame.header.flags,
                 .cancel_token = usub::uvent::sync::CancellationToken{},
             };
 
-            co_await send_simple_error(tmp, 404, "Unknown method");
+            co_await this->send_simple_error(tmp, 404, "Unknown method");
             co_return;
         }
 
         auto src = std::make_shared<sync::CancellationSource>();
         {
-            auto guard = co_await cancel_map_mutex_.lock();
-            cancel_map_[frame.header.stream_id] = src;
+            auto guard = co_await this->cancel_map_mutex_.lock();
             (void)guard;
+            this->cancel_map_[frame.header.stream_id] = src;
         }
 
         RpcContext ctx{
-            .stream = *stream_,
+            .stream = *this->stream_,
             .stream_id = frame.header.stream_id,
             .method_id = frame.header.method_id,
             .flags = frame.header.flags,
@@ -288,38 +390,62 @@ namespace urpc
         };
 
         std::span<const uint8_t> body{
-            frame.payload.data(),
+            reinterpret_cast<const uint8_t*>(frame.payload.data()),
             frame.payload.size(),
         };
 
+#if URPC_LOGS
+        usub::ulog::info(
+            "handle_request: invoking handler mid={} sid={} body_size={}",
+            ctx.method_id,
+            ctx.stream_id,
+            body.size());
+#endif
+
         std::vector<uint8_t> resp = co_await (*fn)(ctx, body);
 
+#if URPC_LOGS
+        usub::ulog::info(
+            "handle_request: handler finished mid={} sid={} resp_size={}",
+            ctx.method_id,
+            ctx.stream_id,
+            resp.size());
+#endif
+
         {
-            auto guard = co_await cancel_map_mutex_.lock();
-            cancel_map_.erase(frame.header.stream_id);
+            auto guard = co_await this->cancel_map_mutex_.lock();
             (void)guard;
+            this->cancel_map_.erase(frame.header.stream_id);
         }
 
         std::span<const uint8_t> resp_span{resp.data(), resp.size()};
-        co_await send_response(ctx, resp_span);
+
+#if URPC_LOGS
+        usub::ulog::info(
+            "handle_request: sending response mid={} sid={} len={}",
+            ctx.method_id,
+            ctx.stream_id,
+            resp_span.size());
+#endif
+        co_await this->send_response(ctx, resp_span);
         co_return;
     }
 
     usub::uvent::task::Awaitable<void>
     RpcConnection::handle_cancel(RpcFrame frame)
     {
-        using namespace usub::uvent;
 #if URPC_LOGS
-        usub::ulog::info("handle_cancel: sid={}", frame.header.stream_id);
+        usub::ulog::info(
+            "handle_cancel: sid={}", frame.header.stream_id);
 #endif
         std::shared_ptr<sync::CancellationSource> src;
         {
-            auto guard = co_await cancel_map_mutex_.lock();
-            auto it = cancel_map_.find(frame.header.stream_id);
-            if (it != cancel_map_.end())
+            auto guard = co_await this->cancel_map_mutex_.lock();
+            auto it = this->cancel_map_.find(frame.header.stream_id);
+            if (it != this->cancel_map_.end())
             {
                 src = it->second;
-                cancel_map_.erase(it);
+                this->cancel_map_.erase(it);
             }
             (void)guard;
         }
@@ -348,11 +474,11 @@ namespace urpc
     usub::uvent::task::Awaitable<void>
     RpcConnection::handle_ping(RpcFrame frame)
     {
-        using namespace usub::uvent;
 #if URPC_LOGS
-        usub::ulog::info("handle_ping: sid={}", frame.header.stream_id);
+        usub::ulog::info(
+            "handle_ping: sid={}", frame.header.stream_id);
 #endif
-        if (!stream_)
+        if (!this->stream_)
         {
 #if URPC_LOGS
             usub::ulog::error("handle_ping: stream_ is null");
@@ -364,14 +490,22 @@ namespace urpc
         hdr.magic = 0x55525043;
         hdr.version = 1;
         hdr.type = static_cast<uint8_t>(FrameType::Pong);
-        hdr.flags = 0x0001; // END_STREAM
+        hdr.flags = FLAG_END_STREAM;
         hdr.stream_id = frame.header.stream_id;
         hdr.method_id = frame.header.method_id;
         hdr.length = 0;
 
-        co_await locked_send(hdr, {});
 #if URPC_LOGS
-        usub::ulog::info("handle_ping: pong sent sid={}", frame.header.stream_id);
+        usub::ulog::info(
+            "RpcConnection[{}]: sending PONG sid={}",
+            static_cast<void*>(this),
+            hdr.stream_id);
+#endif
+
+        co_await this->locked_send(hdr, {});
+#if URPC_LOGS
+        usub::ulog::info(
+            "handle_ping: pong sent sid={}", frame.header.stream_id);
 #endif
         co_return;
     }

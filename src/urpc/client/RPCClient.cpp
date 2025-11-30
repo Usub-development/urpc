@@ -11,12 +11,46 @@
 
 namespace urpc
 {
+    using namespace usub::uvent;
+
+    static task::Awaitable<bool> read_exact(
+        IRpcStream& stream,
+        utils::DynamicBuffer& buf,
+        std::size_t expected)
+    {
+        buf.clear();
+        buf.reserve(expected);
+
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::read_exact: cur={} expected={}",
+            buf.size(), expected);
+#endif
+        ssize_t r = co_await stream.async_read(buf, expected);
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::read_exact: async_read r={} size={}",
+            r, buf.size());
+#endif
+        if (r <= 0)
+        {
+#if URPC_LOGS
+            usub::ulog::warn(
+                "RpcClient::read_exact: r<=0 (r={}) -> fail", r);
+#endif
+            co_return false;
+        }
+
+        co_return true;
+    }
+
     RpcClient::RpcClient(std::string host, uint16_t port)
         : host_(std::move(host))
           , port_(port)
     {
 #if URPC_LOGS
-        usub::ulog::info("RpcClient ctor host={} port={}", host_, port_);
+        usub::ulog::info(
+            "RpcClient ctor host={} port={}", this->host_, this->port_);
 #endif
     }
 
@@ -28,7 +62,13 @@ namespace urpc
 
         std::vector<uint8_t> empty;
 
-        bool ok = co_await ensure_connected();
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::async_call: method_id={} body_size={}",
+            method_id, request_body.size());
+#endif
+
+        bool ok = co_await this->ensure_connected();
         if (!ok)
         {
 #if URPC_LOGS
@@ -37,21 +77,24 @@ namespace urpc
             co_return empty;
         }
 
-        uint32_t sid = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+        uint32_t sid =
+            this->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
         if (sid == 0)
-            sid = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+            sid = this->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+
 #if URPC_LOGS
-        usub::ulog::debug("RpcClient::async_call: method_id={} stream_id={} body_size={}",
-                          method_id, sid, request_body.size());
+        usub::ulog::debug(
+            "RpcClient::async_call: BEFORE register pending sid={}",
+            sid);
 #endif
 
         auto call = std::make_shared<PendingCall>();
         call->event = std::make_shared<sync::AsyncEvent>(
             sync::Reset::Manual, false);
-
         {
-            auto guard = co_await pending_mutex_.lock();
-            pending_calls_[sid] = call;
+            auto guard = co_await this->pending_mutex_.lock();
+            (void)guard;
+            this->pending_calls_[sid] = call;
         }
 
         RpcFrameHeader hdr{};
@@ -62,22 +105,61 @@ namespace urpc
         hdr.stream_id = sid;
         hdr.method_id = method_id;
         hdr.length = static_cast<uint32_t>(request_body.size());
-
         {
-            auto guard = co_await write_mutex_.lock();
-            bool sent = co_await send_frame(*stream_, hdr, request_body);
+            auto guard = co_await this->write_mutex_.lock();
+            (void)guard;
+
+            auto stream = this->stream_;
+            if (!stream)
+            {
+#if URPC_LOGS
+                usub::ulog::error(
+                    "RpcClient::async_call: stream_ is null before send_frame sid={}",
+                    sid);
+#endif
+                auto g2 = co_await this->pending_mutex_.lock();
+                (void)g2;
+                this->pending_calls_.erase(sid);
+                co_return empty;
+            }
+
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call: BEFORE send_frame sid={} len={}",
+                sid, hdr.length);
+#endif
+            bool sent = co_await send_frame(*stream, hdr, request_body);
             if (!sent)
             {
 #if URPC_LOGS
-                usub::ulog::error("RpcClient::async_call: send_frame failed for sid={}", sid);
+                usub::ulog::error(
+                    "RpcClient::async_call: send_frame failed for sid={}",
+                    sid);
 #endif
-                auto g2 = co_await pending_mutex_.lock();
-                pending_calls_.erase(sid);
+                auto g2 = co_await this->pending_mutex_.lock();
+                (void)g2;
+                this->pending_calls_.erase(sid);
                 co_return empty;
             }
         }
 
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::async_call: BEFORE wait sid={}", sid);
+#endif
         co_await call->event->wait();
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::async_call: AFTER wait sid={}", sid);
+#endif
+
+        {
+            auto guard = co_await this->pending_mutex_.lock();
+            (void)guard;
+            auto it = this->pending_calls_.find(sid);
+            if (it != this->pending_calls_.end())
+                this->pending_calls_.erase(it);
+        }
 
         if (call->error)
         {
@@ -89,24 +171,11 @@ namespace urpc
             co_return empty;
         }
 
-        std::vector<uint8_t> resp;
-        {
-            auto guard = co_await pending_mutex_.lock();
-            auto it = pending_calls_.find(sid);
-            if (it != pending_calls_.end())
-            {
-                resp = std::move(it->second->response);
-                pending_calls_.erase(it);
-            }
-            else
-            {
-                resp = std::move(call->response);
-            }
-        }
-
+        std::vector<uint8_t> resp = std::move(call->response);
 #if URPC_LOGS
-        usub::ulog::debug("RpcClient::async_call: completed sid={} resp_size={}",
-                          sid, resp.size());
+        usub::ulog::debug(
+            "RpcClient::async_call: completed sid={} resp_size={}",
+            sid, resp.size());
 #endif
 
         co_return resp;
@@ -114,29 +183,35 @@ namespace urpc
 
     usub::uvent::task::Awaitable<bool> RpcClient::async_ping()
     {
-        using namespace usub::uvent;
 #if URPC_LOGS
         usub::ulog::info("RpcClient::async_ping: start");
 #endif
-        bool ok = co_await ensure_connected();
+        const bool ok = co_await this->ensure_connected();
         if (!ok)
         {
 #if URPC_LOGS
-            usub::ulog::error("RpcClient::async_ping: ensure_connected() failed");
+            usub::ulog::error(
+                "RpcClient::async_ping: ensure_connected() failed");
 #endif
             co_return false;
         }
 
-        uint32_t sid = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+        uint32_t sid =
+            this->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
         if (sid == 0)
-            sid = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+            sid = this->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
 
         auto evt = std::make_shared<sync::AsyncEvent>(
             sync::Reset::Manual, false);
 
         {
-            auto guard = co_await ping_mutex_.lock();
-            ping_waiters_[sid] = evt;
+            auto guard = co_await this->ping_mutex_.lock();
+            (void)guard;
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_ping: register waiter sid={}", sid);
+#endif
+            this->ping_waiters_[sid] = evt;
         }
 
         RpcFrameHeader hdr{};
@@ -149,34 +224,70 @@ namespace urpc
         hdr.length = 0;
 
         {
-            auto guard = co_await write_mutex_.lock();
-            bool sent = co_await send_frame(*stream_, hdr, {});
+            auto guard = co_await this->write_mutex_.lock();
+            (void)guard;
+
+            auto stream = this->stream_;
+            if (!stream)
+            {
+#if URPC_LOGS
+                usub::ulog::error(
+                    "RpcClient::async_ping: stream_ is null before send_frame sid={}",
+                    sid);
+#endif
+                auto g2 = co_await this->ping_mutex_.lock();
+                (void)g2;
+                this->ping_waiters_.erase(sid);
+                co_return false;
+            }
+
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_ping: BEFORE send_frame sid={}", sid);
+#endif
+            const bool sent =
+                co_await send_frame(*stream, hdr, {});
             if (!sent)
             {
 #if URPC_LOGS
-                usub::ulog::error("RpcClient::async_ping: send_frame failed sid={}", sid);
+                usub::ulog::error(
+                    "RpcClient::async_ping: send_frame failed sid={}",
+                    sid);
 #endif
-                auto g2 = co_await ping_mutex_.lock();
-                ping_waiters_.erase(sid);
+                auto g2 = co_await this->ping_mutex_.lock();
+                (void)g2;
+                this->ping_waiters_.erase(sid);
                 co_return false;
             }
         }
 
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::async_ping: BEFORE wait sid={}", sid);
+#endif
         co_await evt->wait();
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::async_ping: AFTER wait sid={}", sid);
+#endif
 
         bool result = false;
         {
-            auto guard = co_await ping_mutex_.lock();
-            auto it = ping_waiters_.find(sid);
-            if (it != ping_waiters_.end())
+            auto guard = co_await this->ping_mutex_.lock();
+            (void)guard;
+
+            auto it = this->ping_waiters_.find(sid);
+            if (it != this->ping_waiters_.end())
             {
                 result = true;
-                ping_waiters_.erase(it);
+                this->ping_waiters_.erase(it);
             }
         }
+
 #if URPC_LOGS
-        usub::ulog::info("RpcClient::async_ping: finished sid={} result={}",
-                         sid, result);
+        usub::ulog::info(
+            "RpcClient::async_ping: finished sid={} result={}",
+            sid, result);
 #endif
         co_return result;
     }
@@ -186,138 +297,212 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::warn("RpcClient::close()");
 #endif
-        running_.store(false, std::memory_order_relaxed);
-        if (stream_)
-        {
-            stream_->shutdown();
-            stream_.reset();
-        }
+        this->running_.store(false, std::memory_order_relaxed);
+
+        std::shared_ptr<IRpcStream> stream;
+        stream.swap(this->stream_);
+
+        if (stream)
+            stream->shutdown();
     }
 
     usub::uvent::task::Awaitable<bool> RpcClient::ensure_connected()
     {
         using namespace usub::uvent;
 
-        if (stream_)
-            co_return true;
-
-        auto guard = co_await connect_mutex_.lock();
-        if (stream_)
-            co_return true;
+        if (this->stream_ &&
+            this->running_.load(std::memory_order_relaxed))
+        {
 #if URPC_LOGS
-        usub::ulog::info("RpcClient::ensure_connected: connecting to {}:{}",
-                         host_, port_);
+            usub::ulog::debug(
+                "RpcClient::ensure_connected: already connected");
+#endif
+            co_return true;
+        }
+
+        auto guard = co_await this->connect_mutex_.lock();
+        (void)guard;
+
+        if (this->stream_ &&
+            this->running_.load(std::memory_order_relaxed))
+        {
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::ensure_connected: already connected (after lock)");
+#endif
+            co_return true;
+        }
+
+        this->stream_.reset();
+
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcClient::ensure_connected: connecting to {}:{}",
+            this->host_, this->port_);
 #endif
 
         net::TCPClientSocket sock;
-        auto res = co_await sock.async_connect(host_.c_str(),
-                                               std::to_string(port_).c_str());
+        auto res = co_await sock.async_connect(
+            this->host_.c_str(),
+            std::to_string(this->port_).c_str());
         if (res.has_value())
         {
 #if URPC_LOGS
-            usub::ulog::error("RpcClient::ensure_connected: async_connect failed, ec={}",
-                              res.value());
+            usub::ulog::error(
+                "RpcClient::ensure_connected: async_connect failed, ec={}",
+                res.value());
 #endif
             co_return false;
         }
 
-        stream_ = std::make_shared<TcpRpcStream>(std::move(sock));
-        running_.store(true, std::memory_order_relaxed);
+        this->stream_ = std::make_shared<TcpRpcStream>(std::move(sock));
+        this->running_.store(true, std::memory_order_relaxed);
+
 #if URPC_LOGS
-        usub::ulog::info("RpcClient::ensure_connected: connected, spawning reader_loop");
+        usub::ulog::info(
+            "RpcClient::ensure_connected: connected, spawning reader_loop");
 #endif
-        system::co_spawn(reader_loop());
+
+        auto self = this->shared_from_this();
+        usub::uvent::system::co_spawn(
+            RpcClient::run_reader_detached(std::move(self)));
+
         co_return true;
     }
 
-    bool RpcClient::parse_error_payload(const usub::uvent::utils::DynamicBuffer& payload,
-                                        uint32_t& out_code,
-                                        std::string& out_msg) const
+    bool RpcClient::parse_error_payload(
+        const usub::uvent::utils::DynamicBuffer& payload,
+        uint32_t& out_code,
+        std::string& out_msg) const
     {
         using urpc::be_to_host;
 
         const std::size_t sz = payload.size();
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::parse_error_payload: payload_size={}", sz);
+#endif
         if (sz < 8)
+        {
+#if URPC_LOGS
+            usub::ulog::warn(
+                "RpcClient::parse_error_payload: size<8 (sz={})", sz);
+#endif
             return false;
+        }
 
         uint32_t code_be = 0;
-        uint32_t len_be  = 0;
+        uint32_t len_be = 0;
 
-        const auto* data = reinterpret_cast<const uint8_t*>(payload.data());
+        const auto* data =
+            reinterpret_cast<const uint8_t*>(payload.data());
 
         std::memcpy(&code_be, data, 4);
-        std::memcpy(&len_be,  data + 4, 4);
+        std::memcpy(&len_be, data + 4, 4);
 
         const uint32_t code = be_to_host(code_be);
-        const uint32_t len  = be_to_host(len_be);
+        const uint32_t len = be_to_host(len_be);
 
         if (sz < 8u + len)
+        {
+#if URPC_LOGS
+            usub::ulog::warn(
+                "RpcClient::parse_error_payload: sz({}) < 8+len({})",
+                sz, 8u + len);
+#endif
             return false;
+        }
 
         out_code = code;
-        out_msg.assign(reinterpret_cast<const char*>(data + 8), len);
+        out_msg.assign(
+            reinterpret_cast<const char*>(data + 8),
+            len);
+
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcClient::parse_error_payload: parsed code={} msg_len={}",
+            out_code, out_msg.size());
+#endif
         return true;
+    }
+
+    usub::uvent::task::Awaitable<void> RpcClient::run_reader_detached(
+        std::shared_ptr<RpcClient> self)
+    {
+#if URPC_LOGS
+        usub::ulog::info("RpcClient::reader_loop wrapper: start");
+#endif
+        co_await self->reader_loop();
+#if URPC_LOGS
+        usub::ulog::info("RpcClient::reader_loop wrapper: end");
+#endif
+        co_return;
     }
 
     usub::uvent::task::Awaitable<void> RpcClient::reader_loop()
     {
-        using namespace usub::uvent;
 #if URPC_LOGS
         usub::ulog::info("RpcClient::reader_loop: started");
 #endif
-        while (running_.load(std::memory_order_relaxed))
+        while (this->running_.load(std::memory_order_relaxed))
         {
-            if (!stream_)
+            auto stream = this->stream_;
+            if (!stream)
             {
 #if URPC_LOGS
-                usub::ulog::error("RpcClient::reader_loop: stream_ is null");
+                usub::ulog::error(
+                    "RpcClient::reader_loop: stream_ is null");
 #endif
                 break;
             }
 
             utils::DynamicBuffer head;
-            head.reserve(sizeof(RpcFrameHeader));
-#if URPC_LOGS
-            usub::ulog::debug("RpcClient::reader_loop: reading header {} bytes",
-                              sizeof(RpcFrameHeader));
-#endif
-            ssize_t r = co_await stream_->async_read(
-                head, sizeof(RpcFrameHeader));
-#if URPC_LOGS
-            usub::ulog::debug("RpcClient::reader_loop: header async_read r={} size={}",
-                              r, head.size());
-#endif
-
-            if (r <= 0)
-            {
-#if URPC_LOGS
-                usub::ulog::warn("RpcClient::reader_loop: header read r<=0, breaking");
-#endif
-                break;
-            }
-
-            if (head.size() < sizeof(RpcFrameHeader))
-            {
-#if URPC_LOGS
-                usub::ulog::warn("RpcClient::reader_loop: header size={} < {}",
-                                 head.size(), sizeof(RpcFrameHeader));
-#endif
-                break;
-            }
-
-            RpcFrameHeader hdr = parse_header(head.data());
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcClient::reader_loop: parsed header magic={} ver={} type={} len={}",
+                "RpcClient::reader_loop: reading header {} bytes",
+                sizeof(RpcFrameHeader));
+#endif
+            const bool ok_hdr = co_await read_exact(
+                *stream, head, sizeof(RpcFrameHeader));
+            if (!ok_hdr)
+            {
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcClient::reader_loop: header read_exact failed");
+#endif
+                break;
+            }
+
+            if (head.size() != sizeof(RpcFrameHeader))
+            {
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcClient::reader_loop: header size={} != {}",
+                    head.size(), sizeof(RpcFrameHeader));
+#endif
+                break;
+            }
+
+            RpcFrameHeader hdr = parse_header(
+                reinterpret_cast<const uint8_t*>(head.data()));
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::reader_loop: parsed header magic={} ver={} "
+                "type={} sid={} len={}",
                 static_cast<unsigned>(hdr.magic),
                 static_cast<unsigned>(hdr.version),
                 static_cast<unsigned>(hdr.type),
+                hdr.stream_id,
                 hdr.length);
 #endif
             if (hdr.magic != 0x55525043 || hdr.version != 1)
             {
 #if URPC_LOGS
-                usub::ulog::warn("RpcClient::reader_loop: invalid header magic/ver");
+                usub::ulog::warn(
+                    "RpcClient::reader_loop: invalid header magic/ver "
+                    "(magic={} ver={})",
+                    static_cast<unsigned>(hdr.magic),
+                    static_cast<unsigned>(hdr.version));
 #endif
                 break;
             }
@@ -327,24 +512,21 @@ namespace urpc
 
             if (hdr.length > 0)
             {
-                frame.payload.reserve(hdr.length);
+                const std::size_t len = hdr.length;
 #if URPC_LOGS
-                usub::ulog::debug("RpcClient::reader_loop: reading payload {} bytes",
-                                  hdr.length);
+                usub::ulog::debug(
+                    "RpcClient::reader_loop: reading payload {} bytes",
+                    len);
 #endif
-
-                ssize_t r2 = co_await stream_->async_read(
-                    frame.payload, static_cast<size_t>(hdr.length));
-#if URPC_LOGS
-                usub::ulog::debug("RpcClient::reader_loop: payload async_read r2={} size={}",
-                                  r2, frame.payload.size());
-#endif
-                if (r2 <= 0 || frame.payload.size() < hdr.length)
+                const bool ok_body = co_await read_exact(
+                    *stream, frame.payload, len);
+                if (!ok_body || frame.payload.size() != len)
                 {
 #if URPC_LOGS
                     usub::ulog::warn(
-                        "RpcClient::reader_loop: payload read failed r2={} size={} len={}",
-                        r2, frame.payload.size(), hdr.length);
+                        "RpcClient::reader_loop: payload read_exact failed "
+                        "size={} len={}",
+                        frame.payload.size(), len);
 #endif
                     break;
                 }
@@ -352,27 +534,39 @@ namespace urpc
             else
             {
 #if URPC_LOGS
-                usub::ulog::debug("RpcClient::reader_loop: zero-length payload");
+                usub::ulog::debug(
+                    "RpcClient::reader_loop: zero-length payload");
 #endif
             }
 
             auto ft = static_cast<FrameType>(frame.header.type);
 #if URPC_LOGS
-            usub::ulog::debug("RpcClient::reader_loop: got frame type={} sid={} len={}",
-                              static_cast<int>(ft),
-                              frame.header.stream_id,
-                              frame.header.length);
+            usub::ulog::debug(
+                "RpcClient::reader_loop: got frame type={} sid={} len={}",
+                static_cast<int>(ft),
+                frame.header.stream_id,
+                frame.header.length);
 #endif
 
             switch (ft)
             {
             case FrameType::Response:
                 {
+#if URPC_LOGS
+                    usub::ulog::debug(
+                        "RpcClient::reader_loop: handling Response sid={} len={} flags={}",
+                        frame.header.stream_id,
+                        frame.header.length,
+                        frame.header.flags);
+#endif
                     std::shared_ptr<PendingCall> call;
                     {
-                        auto guard = co_await pending_mutex_.lock();
-                        auto it = pending_calls_.find(frame.header.stream_id);
-                        if (it != pending_calls_.end())
+                        auto guard = co_await this->pending_mutex_.lock();
+                        (void)guard;
+
+                        auto it =
+                            this->pending_calls_.find(frame.header.stream_id);
+                        if (it != this->pending_calls_.end())
                             call = it->second;
                     }
 
@@ -386,21 +580,26 @@ namespace urpc
                         break;
                     }
 
-                    bool is_error = (frame.header.flags & FLAG_ERROR) != 0;
+                    const bool is_error =
+                        (frame.header.flags & FLAG_ERROR) != 0;
 
                     if (is_error)
                     {
                         uint32_t code = 0;
                         std::string msg;
-                        if (parse_error_payload(frame.payload, code, msg))
+                        if (this->parse_error_payload(
+                            frame.payload, code, msg))
                         {
                             call->error = true;
                             call->error_code = code;
                             call->error_message = std::move(msg);
 #if URPC_LOGS
                             usub::ulog::warn(
-                                "RpcClient::reader_loop: error Response sid={} code={} msg='{}'",
-                                frame.header.stream_id, code, call->error_message);
+                                "RpcClient::reader_loop: error Response "
+                                "sid={} code={} msg='{}'",
+                                frame.header.stream_id,
+                                code,
+                                call->error_message);
 #endif
                         }
                         else
@@ -410,7 +609,8 @@ namespace urpc
                             call->error_message = "Malformed error payload";
 #if URPC_LOGS
                             usub::ulog::warn(
-                                "RpcClient::reader_loop: malformed error payload sid={}",
+                                "RpcClient::reader_loop: malformed error "
+                                "payload sid={}",
                                 frame.header.stream_id);
 #endif
                         }
@@ -439,8 +639,9 @@ namespace urpc
             case FrameType::Ping:
                 {
 #if URPC_LOGS
-                    usub::ulog::info("RpcClient::reader_loop: received Ping sid={}",
-                                     frame.header.stream_id);
+                    usub::ulog::info(
+                        "RpcClient::reader_loop: received Ping sid={}",
+                        frame.header.stream_id);
 #endif
                     RpcFrameHeader resp{};
                     resp.magic = 0x55525043;
@@ -451,22 +652,43 @@ namespace urpc
                     resp.method_id = frame.header.method_id;
                     resp.length = 0;
 
-                    auto guard = co_await write_mutex_.lock();
-                    co_await send_frame(*stream_, resp, {});
+                    auto guard = co_await this->write_mutex_.lock();
+                    (void)guard;
+
+                    auto stream2 = this->stream_;
+                    if (!stream2)
+                    {
+#if URPC_LOGS
+                        usub::ulog::warn(
+                            "RpcClient::reader_loop: stream_ is null in Ping handler");
+#endif
+                        break;
+                    }
+
+#if URPC_LOGS
+                    usub::ulog::debug(
+                        "RpcClient::reader_loop: sending Pong sid={}",
+                        resp.stream_id);
+#endif
+                    co_await send_frame(*stream2, resp, {});
                     break;
                 }
 
             case FrameType::Pong:
                 {
 #if URPC_LOGS
-                    usub::ulog::info("RpcClient::reader_loop: received Pong sid={}",
-                                     frame.header.stream_id);
+                    usub::ulog::info(
+                        "RpcClient::reader_loop: received Pong sid={}",
+                        frame.header.stream_id);
 #endif
                     std::shared_ptr<sync::AsyncEvent> evt;
                     {
-                        auto guard = co_await ping_mutex_.lock();
-                        auto it = ping_waiters_.find(frame.header.stream_id);
-                        if (it != ping_waiters_.end())
+                        auto guard = co_await this->ping_mutex_.lock();
+                        (void)guard;
+
+                        auto it =
+                            this->ping_waiters_.find(frame.header.stream_id);
+                        if (it != this->ping_waiters_.end())
                             evt = it->second;
                     }
                     if (evt)
@@ -487,14 +709,16 @@ namespace urpc
                 break;
             }
         }
+
 #if URPC_LOGS
         usub::ulog::warn("RpcClient::reader_loop: exiting");
 #endif
-        running_.store(false, std::memory_order_relaxed);
+        this->running_.store(false, std::memory_order_relaxed);
 
         {
-            auto guard = co_await pending_mutex_.lock();
-            for (auto& [sid, call] : pending_calls_)
+            auto guard = co_await this->pending_mutex_.lock();
+            (void)guard;
+            for (auto& [sid, call] : this->pending_calls_)
             {
                 if (call && call->event)
                 {
@@ -504,16 +728,24 @@ namespace urpc
                     call->event->set();
                 }
             }
-            pending_calls_.clear();
+            this->pending_calls_.clear();
         }
 
         {
-            auto guard = co_await ping_mutex_.lock();
-            for (auto& [sid, evt] : ping_waiters_)
+            auto guard = co_await this->ping_mutex_.lock();
+            (void)guard;
+            for (auto& [sid, evt] : this->ping_waiters_)
             {
-                if (evt) evt->set();
+                if (evt)
+                    evt->set();
             }
-            ping_waiters_.clear();
+            this->ping_waiters_.clear();
+        }
+
+        {
+            auto guard = co_await this->connect_mutex_.lock();
+            (void)guard;
+            this->stream_.reset();
         }
 
         co_return;

@@ -1,4 +1,4 @@
-// urpc/server/RpcServer.cpp
+#include <chrono>
 
 #include <urpc/server/RPCServer.h>
 
@@ -20,6 +20,11 @@ namespace urpc
 
     RpcMethodRegistry& RpcServer::registry()
     {
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcServer::registry: returning registry, this={}",
+            static_cast<const void*>(this));
+#endif
         return this->registry_;
     }
 
@@ -31,7 +36,7 @@ namespace urpc
             "RpcServer: register_method method_id={}",
             method_id);
 #endif
-        this->registry_.register_method(method_id, std::move(fn));
+        this->registry_.register_method(method_id, fn);
     }
 
     void RpcServer::register_method(std::string_view name,
@@ -41,14 +46,16 @@ namespace urpc
         usub::ulog::debug(
             "RpcServer: register_method name={}", name);
 #endif
-        this->registry_.register_method(name, std::move(fn));
+        this->registry_.register_method(name, fn);
     }
 
     usub::uvent::task::Awaitable<void> RpcServer::run_async()
     {
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcServer::run_async starting accept_loop");
+            "RpcServer::run_async starting accept_loop "
+            "host={} port={} threads={}",
+            this->host_, this->port_, this->threads_);
 #endif
         co_await this->accept_loop();
 #if URPC_LOGS
@@ -68,12 +75,11 @@ namespace urpc
 
         usub::Uvent uvent(this->threads_);
 
-        usub::uvent::system::co_spawn(
-            [this]() -> usub::uvent::task::Awaitable<void>
-            {
-                co_await this->accept_loop();
-                co_return;
-            }());
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcServer::run: spawning run_async coroutine");
+#endif
+        usub::uvent::system::co_spawn(this->run_async());
 
         uvent.run();
 #if URPC_LOGS
@@ -84,6 +90,8 @@ namespace urpc
     usub::uvent::task::Awaitable<void> RpcServer::accept_loop()
     {
         using namespace usub::uvent;
+        using namespace std::chrono_literals;
+
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer: creating TCPServerSocket on {}:{}",
@@ -93,6 +101,7 @@ namespace urpc
         net::TCPServerSocket acceptor{
             this->host_.c_str(), this->port_
         };
+
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer: accept_loop started, this={} acceptor_fd={}",
@@ -103,24 +112,23 @@ namespace urpc
         for (;;)
         {
 #if URPC_LOGS
-            usub::ulog::info(
-                "RpcServer: BEFORE async_accept()");
+            usub::ulog::info("RpcServer: BEFORE async_accept()");
 #endif
             auto soc = co_await acceptor.async_accept();
 #if URPC_LOGS
-            usub::ulog::info(
-                "RpcServer: AFTER async_accept()");
+            usub::ulog::info("RpcServer: AFTER async_accept()");
 #endif
 
             if (!soc)
             {
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcServer: async_accept() returned "
-                    "empty socket");
+                    "RpcServer: async_accept() returned empty socket, backing off");
 #endif
+                co_await system::this_coroutine::sleep_for(50ms);
                 continue;
             }
+
 #if URPC_LOGS
             usub::ulog::info(
                 "RpcServer: got TCPClientSocket, fd={}",
@@ -129,38 +137,38 @@ namespace urpc
             usub::ulog::info(
                 "RpcServer: BEFORE make_shared<TcpRpcStream>");
 #endif
-            auto stream =
-                std::make_shared<TcpRpcStream>(
-                    std::move(soc.value()));
+
+            auto stream = std::make_shared<TcpRpcStream>(
+                std::move(soc.value()));
+
 #if URPC_LOGS
             usub::ulog::info(
-                "RpcServer: AFTER make_shared<TcpRpcStream> "
-                "stream={}",
+                "RpcServer: AFTER make_shared<TcpRpcStream> stream={}",
                 static_cast<void*>(stream.get()));
 
             usub::ulog::info(
                 "RpcServer: BEFORE make_shared<RpcConnection>");
 #endif
-            auto conn =
-                std::make_shared<RpcConnection>(
-                    stream, this->registry_);
+
+            auto conn = std::make_shared<RpcConnection>(
+                stream, this->registry_);
+
 #if URPC_LOGS
             usub::ulog::info(
-                "RpcServer: AFTER make_shared<RpcConnection> "
-                "conn={}",
+                "RpcServer: AFTER make_shared<RpcConnection> conn={}",
                 static_cast<void*>(conn.get()));
 
             usub::ulog::info(
-                "RpcServer: BEFORE co_spawn(RpcConnection::"
-                "run_detached), conn={}",
+                "RpcServer: BEFORE co_spawn(RpcConnection::run_detached), conn={}",
                 static_cast<void*>(conn.get()));
 #endif
+
             usub::uvent::system::co_spawn(
                 urpc::RpcConnection::run_detached(conn));
+
 #if URPC_LOGS
             usub::ulog::info(
-                "RpcServer: AFTER co_spawn(RpcConnection::"
-                "run_detached), conn={}",
+                "RpcServer: AFTER co_spawn(RpcConnection::run_detached), conn={}",
                 static_cast<void*>(conn.get()));
 #endif
         }

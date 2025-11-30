@@ -21,7 +21,7 @@ int main()
         .warn_path = nullptr,
         .error_path = nullptr,
         .flush_interval_ns = 2'000'000ULL,
-        .queue_capacity = 14,
+        .queue_capacity = 16384,
         .batch_size = 512,
         .enable_color_stdout = true,
         .max_file_size_bytes = 10 * 1024 * 1024,

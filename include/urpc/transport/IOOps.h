@@ -14,15 +14,10 @@ namespace urpc
         const uint8_t* data,
         size_t n)
     {
-        size_t sent = 0;
-        while (sent < n)
-        {
-            ssize_t r = co_await stream.async_write(
-                const_cast<uint8_t*>(data + sent),
-                n - sent);
-            if (r <= 0) co_return false;
-            sent += static_cast<size_t>(r);
-        }
+        ssize_t r = co_await stream.async_write(
+            const_cast<uint8_t*>(data),
+            n);
+        if (r <= 0) co_return false;
         co_return true;
     }
 

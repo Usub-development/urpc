@@ -1,4 +1,3 @@
-// urpc/registry/RpcMethodRegistry.h
 //
 // Created by root on 11/29/25.
 //
@@ -7,7 +6,6 @@
 #define RPCMETHODREGISTRY_H
 
 #include <cstdint>
-#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -23,8 +21,10 @@ namespace urpc
         template <uint64_t MethodId, typename F>
         void register_method_ct(F&& f)
         {
-            this->handlers_[MethodId] =
-                static_cast<RpcHandlerPtr>(+f);
+            this->register_method(
+                MethodId,
+                static_cast<RpcHandlerPtr>(+std::forward<F>(f))
+            );
         }
 
         void register_method(uint64_t method_id, RpcHandlerPtr fn);
