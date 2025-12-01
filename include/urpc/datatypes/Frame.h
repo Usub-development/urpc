@@ -39,6 +39,7 @@ namespace urpc
         uint8_t version;
         uint8_t type;
         uint16_t flags;
+        uint32_t reserved;
         uint32_t stream_id;
         uint64_t method_id;
         uint32_t length;
@@ -50,10 +51,11 @@ namespace urpc
         1 +
         sizeof(uint16_t) +
         sizeof(uint32_t) +
+        sizeof(uint32_t) +
         sizeof(uint64_t) +
         sizeof(uint32_t);
 
-    static_assert(RpcFrameHeaderSize == 24);
+    static_assert(sizeof(RpcFrameHeader) == 32);
 
     URPC_ALWAYS_INLINE void serialize_header(const RpcFrameHeader& src, uint8_t* out)
     {

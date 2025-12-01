@@ -1,0 +1,68 @@
+site_name: uRPC Documentation
+site_description: uRPC is a compact binary RPC protocol built on top of a generic async byte stream
+site_url: https://usub-development.github.io/urpc/
+repo_url: https://github.com/Usub-development/urpc
+repo_name: Usub-development/urpc
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search
+  - autorefs
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - admonition
+  - attr_list
+  - toc:
+      permalink: true
+
+nav:
+  - Overview: urpc/index.md
+  - Protocol:
+      - Wire Format: urpc/wire-format.md
+      - Client: urpc/client.md
+      - Server: urpc/server.md
+      - Transport & Method IDs: urpc/transport-and-ids.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Usub-development/urpc
+      name: GitHub Repository
+    - icon: fontawesome/solid/star
+      link: https://github.com/Usub-development/urpc/stargazers
+      name: Star on GitHub
+
+copyright: >
+  Copyright &copy; 2025 Usub-development, Kirill Zhukov (g2px1)

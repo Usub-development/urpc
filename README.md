@@ -17,7 +17,7 @@ Every message on the wire is a **Frame**:
 
 ## Header
 
-**Size:** 24 bytes  
+**Size:** 28 bytes  
 **Byte order:** Big-Endian
 
 Layout:
@@ -26,12 +26,16 @@ Layout:
 uint32  magic       // 'URPC' = 0x55525043
 uint8   version     // protocol version, currently 1
 uint8   type        // frame type (see FrameType table)
-uint8   flags       // bitmask (END_STREAM, ERROR, COMPRESSED, …)
-uint8   reserved    // must be 0
+uint16  flags       // bitmask (END_STREAM, ERROR, COMPRESSED, …)
+uint32  reserved    // must be 0; reserved for future protocol extensions
 uint32  stream_id   // logical stream id (similar to HTTP/2 stream id)
 uint64  method_id   // FNV1a64("Service.Method") for requests; echoed in responses
 uint32  length      // payload size in bytes
-````
+```
+
+The `reserved` field is included in the header (total size = 32 bytes),
+but is not used by the current protocol version. Implementations MUST
+send it as zero and MUST ignore its value when receiving.
 
 ---
 
