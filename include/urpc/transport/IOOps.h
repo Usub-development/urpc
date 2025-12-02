@@ -26,10 +26,10 @@ namespace urpc
         const RpcFrameHeader& hdr,
         std::span<const uint8_t> payload)
     {
-        uint8_t header_buf[sizeof(RpcFrameHeader)];
+        uint8_t header_buf[RpcFrameHeaderSize];
         serialize_header(hdr, header_buf);
 
-        if (!(co_await write_all(stream, header_buf, sizeof(header_buf))))
+        if (!(co_await write_all(stream, header_buf, RpcFrameHeaderSize)))
             co_return false;
 
         if (!payload.empty())

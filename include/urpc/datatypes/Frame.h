@@ -55,8 +55,6 @@ namespace urpc
         sizeof(uint64_t) +
         sizeof(uint32_t);
 
-    static_assert(sizeof(RpcFrameHeader) == 32);
-
     URPC_ALWAYS_INLINE void serialize_header(const RpcFrameHeader& src, uint8_t* out)
     {
         auto put_be = [](uint8_t*& p, auto v)
@@ -78,6 +76,7 @@ namespace urpc
         put8(p, src.version);
         put8(p, static_cast<uint8_t>(src.type));
         put_be(p, static_cast<uint16_t>(src.flags));
+        put_be(p, static_cast<uint32_t>(src.reserved));
         put_be(p, static_cast<uint32_t>(src.stream_id));
         put_be(p, static_cast<uint64_t>(src.method_id));
         put_be(p, static_cast<uint32_t>(src.length));
@@ -106,6 +105,7 @@ namespace urpc
         get8(p, h.version);
         get8(p, h.type);
         get_be(p, h.flags);
+        get_be(p, h.reserved);
         get_be(p, h.stream_id);
         get_be(p, h.method_id);
         get_be(p, h.length);

@@ -91,10 +91,10 @@ namespace urpc
 #if URPC_LOGS
             usub::ulog::debug(
                 "RpcConnection::loop: reading header {} bytes",
-                sizeof(RpcFrameHeader));
+                RpcFrameHeaderSize);
 #endif
             const bool ok_hdr = co_await read_exact(
-                *this->stream_, head, sizeof(RpcFrameHeader));
+                *this->stream_, head, RpcFrameHeaderSize);
             if (!ok_hdr)
             {
 #if URPC_LOGS
@@ -106,12 +106,12 @@ namespace urpc
                 break;
             }
 
-            if (head.size() != sizeof(RpcFrameHeader))
+            if (head.size() != RpcFrameHeaderSize)
             {
 #if URPC_LOGS
                 usub::ulog::warn(
                     "RpcConnection::loop: header size={} != {}, dropping",
-                    head.size(), sizeof(RpcFrameHeader));
+                    head.size(), RpcFrameHeaderSize);
 #endif
 
 
