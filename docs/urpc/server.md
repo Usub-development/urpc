@@ -1,241 +1,428 @@
 # Server Behaviour
 
-This section describes `RpcServer`, `RpcConnection`, and `RpcMethodRegistry`.
+This section describes how the server side of uRPC operates:
+`RpcServer`, `RpcConnection`, and `RpcMethodRegistry`.
 
-## RpcServer
+It covers:
+- TCP / TLS / mTLS server transports
+- Accept loop
+- Per-connection RPC handling
+- Method registry
+- Cancellation
+- Response/error handling
 
-Key fields:
+---
 
-* `std::string host_`
-* `uint16_t port_`
-* `int threads_`
-* `RpcMethodRegistry registry_`
+# **RpcServer**
 
-### Running the server
+`RpcServer` owns:
+
+* Listener address (host/port)
+* Worker thread count
+* Method registry
+* Transport factory (`IRpcStreamFactory`) — TCP, TLS, mTLS
+
+```cpp
+struct RpcServerConfig {
+    std::string host;
+    uint16_t    port;
+    int         threads = 1;
+    std::shared_ptr<IRpcStreamFactory> stream_factory;
+};
+```
+
+If `stream_factory` is null, the server uses plain TCP (`TcpRpcStreamFactory`).
+
+---
+
+## **Running the server**
 
 Two entry points:
 
-* `Awaitable<void> RpcServer::run_async()`
+### `Awaitable<void> RpcServer::run_async()`
 
-    * Runs the `accept_loop()` coroutine.
-* `void RpcServer::run()`
+Runs the asynchronous accept loop.
 
-    * Creates `usub::Uvent` with `threads_` worker threads.
-    * Spawns `run_async()` via `system::co_spawn`.
-    * Calls `uvent.run()` to start event loop.
+### `void RpcServer::run()`
 
-### Accept loop
+* Creates a `usub::Uvent` instance with `threads_` worker threads.
+* Spawns `run_async()` via `system::co_spawn`.
+* Calls `uvent.run()` to start the event loop.
 
-`RpcServer::accept_loop()`:
+This is the typical entry point for a standalone server.
 
-1. Creates `net::TCPServerSocket acceptor{host_.c_str(), port_}`.
-2. Enters infinite loop:
+---
 
-    * Calls `auto soc = co_await acceptor.async_accept()`.
-    * If `soc` is empty:
+# **Accept loop**
 
-        * Logs warning.
-        * Sleeps for 50ms via `this_coroutine::sleep_for(50ms)`.
-        * Continues.
-    * On success:
+`RpcServer::accept_loop()` performs:
 
-        * Wraps accepted socket into `std::make_shared<TcpRpcStream>(std::move(soc.value()))`.
-        * Creates `std::make_shared<RpcConnection>(stream, registry_)`.
-        * Spawns `RpcConnection::run_detached(conn)` via `co_spawn`.
+1. Creates the listening socket:
 
-Each accepted TCP connection gets its own `RpcConnection` instance and dedicated read loop.
+   ```cpp
+   net::TCPServerSocket acceptor(host_.c_str(), port_);
+   ```
 
-## RpcMethodRegistry
+2. Infinite loop:
 
-`RpcMethodRegistry` maps `method_id` → handler function pointer.
+   ```cpp
+   while (true) {
+       auto soc = co_await acceptor.async_accept();
+   }
+   ```
+
+3. On failed accept:
+
+    * Log
+    * Sleep 50ms (`this_coroutine::sleep_for`)
+    * Continue
+
+4. On success:
+
+    * Convert accepted TCP socket → `IRpcStream` using `stream_factory`
+
+      ```cpp
+      auto stream = stream_factory->create_server_stream(std::move(soc.value()));
+      ```
+
+      With TLS/mTLS factory this performs a **server-side TLS handshake**.
+
+    * Create connection:
+
+      ```cpp
+      auto conn = std::make_shared<RpcConnection>(stream, registry_);
+      ```
+
+    * Spawn read loop:
+
+      ```cpp
+      system::co_spawn(RpcConnection::run_detached(conn));
+      ```
+
+Each accepted connection gets its own:
+
+* `RpcConnection` instance
+* Independent coroutine for reading frames
+* Independent write serialization mutex
+
+---
+
+# **RpcMethodRegistry**
+
+Maps:
+
+```
+method_id → function pointer (RpcHandlerFn*)
+```
 
 Handler type:
 
 ```cpp
-using RpcHandlerAwaitable = usub::uvent::task::Awaitable<void>;
-
-using RpcHandlerFn = usub::uvent::task::Awaitable<std::vector<uint8_t>>(
-    RpcContext&, std::span<const uint8_t>);
-
-using RpcHandlerPtr = RpcHandlerFn*;
+using RpcHandlerFn =
+    usub::uvent::task::Awaitable<std::vector<uint8_t>>(
+        RpcContext&, std::span<const uint8_t>);
 ```
 
 API:
 
-* `void register_method(uint64_t method_id, RpcHandlerPtr fn);`
-* `void register_method(std::string_view name, RpcHandlerPtr fn);`
-
-    * Uses `fnv1a64_rt(name)` to compute `method_id`.
-* `RpcHandlerPtr find(uint64_t method_id) const;`
-
-Compile-time registration helper:
-
 ```cpp
-template <uint64_t MethodId, typename F>
-void RpcMethodRegistry::register_method_ct(F&& f)
-{
-    this->register_method(
-        MethodId,
-        static_cast<RpcHandlerPtr>(+std::forward<F>(f))
-    );
-}
+void register_method(uint64_t method_id, RpcHandlerPtr fn);
+void register_method(std::string_view name, RpcHandlerPtr fn); // runtime hash
+RpcHandlerPtr find(uint64_t method_id) const;
 ```
 
-`RpcServer` exposes the registry:
+Compile-time registration:
 
 ```cpp
-RpcMethodRegistry& RpcServer::registry();
-```
-
-And forwarders:
-
-```cpp
-void register_method(uint64_t method_id, RpcHandlerFn fn);
-void register_method(std::string_view name, RpcHandlerFn fn);
-
-template <uint64_t MethodId, typename F>
+template<uint64_t MethodId, typename F>
 void register_method_ct(F&& f);
 ```
 
-## RpcContext
-
-Passed to every handler:
+Server forwards registry access:
 
 ```cpp
-struct RpcContext
-{
+RpcMethodRegistry& registry();
+```
+
+---
+
+# **RpcContext**
+
+Passed to all handlers:
+
+```cpp
+struct RpcContext {
     IRpcStream& stream;
-    uint32_t stream_id;
-    uint64_t method_id;
-    uint16_t flags;
-    usub::uvent::sync::CancellationToken cancel_token;
+    uint32_t    stream_id;
+    uint64_t    method_id;
+    uint16_t    flags;
+    CancellationToken cancel_token;
 };
 ```
 
-* `stream` – underlying stream used by the connection (shared between handlers and control path).
-* `stream_id` – ID of the request stream.
-* `method_id` – numeric method identifier.
-* `flags` – frame flags from the Request header.
-* `cancel_token` – token linked to client cancellation; handlers may observe/await it.
+Purpose:
 
-## RpcConnection
+* Identify which stream the response must be sent on
+* Access transport for optional out-of-band writes
+* Propagate cooperative cancellation
 
-Per-connection actor that:
+---
 
-* Reads frames from `IRpcStream`.
-* Dispatches Requests to handlers.
-* Sends Responses, errors, and Pong frames.
-* Manages per-stream cancellation state.
+# **RpcConnection**
+
+A `RpcConnection` manages a single TCP/TLS/mTLS connection.
+
+Responsibilities:
+
+* Read frames
+* Dispatch requests
+* Manage per-RPC cancellation
+* Send responses and errors
+* Handle Ping/Pong
 
 Key fields:
 
-* `std::shared_ptr<IRpcStream> stream_`
-* `RpcMethodRegistry& registry_`
-* `AsyncMutex write_mutex_`
-* `AsyncMutex cancel_map_mutex_`
-* `std::unordered_map<uint64_t, std::shared_ptr<CancellationSource>> cancel_map_`
+```cpp
+std::shared_ptr<IRpcStream> stream_;
+RpcMethodRegistry& registry_;
+AsyncMutex write_mutex_;
+AsyncMutex cancel_map_mutex_;
+std::unordered_map<uint32_t,
+    std::shared_ptr<CancellationSource>> cancel_map_;
+```
 
-### Lifecycle
+---
 
-`RpcConnection::run_detached(std::shared_ptr<RpcConnection> self)`:
+## **Lifecycle**
 
-* Ensures `self` is non-null.
-* Awaits `self->loop()`.
-* Returns.
+Connection entrypoint:
 
-### Main loop
+```cpp
+static Awaitable<void> run_detached(std::shared_ptr<RpcConnection> self);
+```
+
+This awaits:
+
+```cpp
+co_await self->loop();
+```
+
+On return:
+
+* The connection is done
+* Transport will be shut down by caller or by read loop
+
+---
+
+# **Main loop**
 
 `RpcConnection::loop()`:
 
-1. Validates `stream_` is not null.
-2. Enters infinite loop:
+1. Validate `stream_`
+2. Loop forever:
 
-    * If `stream_` becomes null, exits.
-    * Reads header (28 bytes) into `DynamicBuffer`.
-    * Parses header with `parse_header()`.
-    * Validates `magic == 0x55525043` and `version == 1`. On failure, shuts down stream and exits.
-    * If `hdr.length > 0`, reads payload bytes into `frame.payload`.
-    * Dispatches on `FrameType ft = static_cast<FrameType>(header.type)`:
+    * Read header (32 bytes)
+    * Parse header
+    * Validate magic/version
+    * Read payload (if any)
+    * Dispatch by frame type
 
-#### Request handling
+---
 
-`RpcConnection::handle_request(RpcFrame frame)`:
+# **Request Handling**
 
-1. Looks up `RpcHandlerPtr fn = registry_.find(method_id)`.
+```cpp
+Awaitable<void> handle_request(RpcFrame frame);
+```
+
+Steps:
+
+1. Lookup handler:
+
+   ```cpp
+   auto fn = registry_.find(method_id);
+   ```
 
 2. If not found:
 
-    * Constructs temporary `RpcContext` with empty `CancellationToken`.
-    * Sends error response with `error_code = 404`, `message = "Unknown method"`.
-    * Returns.
+    * Send error response with:
 
-3. Creates `CancellationSource src` and stores in `cancel_map_[stream_id]` under `cancel_map_mutex_`.
+      ```
+      code = 404
+      message = "Unknown method"
+      ```
+    * Return
 
-4. Builds `RpcContext ctx`:
+3. Create a `CancellationSource` for this RPC:
 
-    * `stream = *stream_`
-    * `stream_id = header.stream_id`
-    * `method_id = header.method_id`
-    * `flags = header.flags`
-    * `cancel_token = src->token()`
+   ```cpp
+   cancel_map_[stream_id] = src;
+   ```
 
-5. Constructs payload span from `frame.payload`.
+4. Build `RpcContext`:
 
-6. Invokes handler coroutine: `std::vector<uint8_t> resp = co_await (*fn)(ctx, body);`.
+   ```cpp
+   ctx.stream       = *stream_;
+   ctx.stream_id    = header.stream_id;
+   ctx.method_id    = header.method_id;
+   ctx.flags        = header.flags;
+   ctx.cancel_token = src->token();
+   ```
 
-7. Removes entry from `cancel_map_` for this `stream_id`.
+5. Invoke handler:
 
-8. Sends success response via `send_response(ctx, resp_span)`.
+   ```cpp
+   auto resp = co_await (*fn)(ctx, payload_span);
+   ```
 
-#### Cancel handling
+6. Remove cancellation source:
 
-`RpcConnection::handle_cancel(RpcFrame frame)`:
+   ```cpp
+   cancel_map_.erase(stream_id);
+   ```
 
-1. Looks up `CancellationSource` in `cancel_map_` for `stream_id` under `cancel_map_mutex_`.
+7. Send success:
+
+   ```cpp
+   send_response(ctx, resp);
+   ```
+
+---
+
+# **Cancel Handling**
+
+Triggered by frame:
+
+```
+type = FrameType::Cancel
+```
+
+`handle_cancel(frame)`:
+
+1. Lookup `CancellationSource` in `cancel_map_`
 2. If found:
 
-    * Erases the entry.
-    * Calls `src->request_cancel()`.
-3. If not found: logs missing cancel source.
+    * Remove it
+    * Call `src->request_cancel()`
+3. Otherwise:
 
-Handler code is expected to observe the `CancellationToken` and cooperatively stop work.
+    * Log missing source
 
-#### Ping handling
+Handlers must cooperatively observe `ctx.cancel_token`.
 
-`RpcConnection::handle_ping(RpcFrame frame)`:
+---
 
-1. Verifies `stream_` is non-null.
-2. Builds `RpcFrameHeader` for Pong:
+# **Ping Handling**
 
-    * `type = FrameType::Pong`
-    * `flags = FLAG_END_STREAM`
-    * `stream_id = frame.header.stream_id`
-    * `method_id = frame.header.method_id`
-    * `length = 0`
-3. Sends Pong via `locked_send(hdr, {})`.
+`handle_ping(frame)`:
 
-#### Unknown frame types
+* Always sends a matching Pong:
 
-All frames other than `Request`, `Cancel`, `Ping` are logged and ignored.
+```
+type = Pong
+flags = END_STREAM
+stream_id = same
+method_id = same
+payload = empty
+```
 
-### Sending frames from server
+Uses `locked_send` to serialize write.
 
-`RpcConnection::locked_send(const RpcFrameHeader& hdr, std::span<const uint8_t> body)`:
+---
 
-* Acquires `write_mutex_`.
-* Calls `send_frame(*stream_, hdr, body)` (see transport section).
-* Ensures frames from different coroutines are not interleaved.
+# **Pong / Unknown Types**
 
-`RpcConnection::send_response(RpcContext& ctx, std::span<const uint8_t> body)`:
+Server ignores:
 
-* Builds `Response` header:
+* `Response`
+* `Stream`
+* `Pong`
+* Unknown types
 
-    * `type = FrameType::Response`
-    * `flags = FLAG_END_STREAM`
-    * `stream_id = ctx.stream_id`
-    * `method_id = ctx.method_id`
-    * `length = body.size()`
+Only logs them.
 
-* Uses `locked_send` to send.
+---
 
-`RpcConnection::send_simple_error(...)` builds error payload and sends `Response` with `FLAG_ERROR | FLAG_END_STREAM`.
+# **Sending frames**
+
+### `locked_send(hdr, body)`
+
+* Acquires `write_mutex_`
+* Calls `send_frame(*stream_, hdr, body)`
+
+Guarantees **atomicity** of each frame on the wire.
+
+### `send_response(ctx, body)`
+
+Builds:
+
+```
+type      = Response
+flags     = END_STREAM
+stream_id = ctx.stream_id
+method_id = ctx.method_id
+length    = body.size()
+```
+
+Then calls `locked_send`.
+
+### `send_simple_error(ctx, code, msg)`
+
+Builds an error payload:
+
+```
+u32: code
+u32: msg_len
+msg bytes
+(details unused)
+```
+
+And sends with:
+
+```
+flags = END_STREAM | ERROR
+```
+
+---
+
+# **TLS / mTLS on the server**
+
+Server TLS is enabled by providing a TLS stream factory:
+
+```cpp
+config.stream_factory =
+    std::make_shared<TlsRpcStreamFactory>(TlsServerSettings{
+        .ca         = "ca.crt",        // optional (required for mTLS)
+        .cert       = "server.crt",
+        .key        = "server.key",
+        .require_client_cert = true,    // mTLS
+    });
+```
+
+The accept loop performs:
+
+* TCP accept
+* TLS handshake inside `create_server_stream`
+* If handshake fails → connection closed
+* On success → `RpcConnection` created
+
+mTLS validation includes:
+
+* Proper client certificate
+* CA chain validation
+* SAN/Hostname checks (optional for client certs)
+* Access to full peer certificate via `stream_->peer_certificate()`
+
+Everything below the abstract `IRpcStream` is transport-specific.
+
+---
+
+# **Summary**
+
+* Server accepts TCP or TLS/mTLS connections.
+* Each connection gets its own `RpcConnection`.
+* All requests are fully multiplexed by `stream_id`.
+* Cancellation is cooperative via `CancellationToken`.
+* Ping/Pong is built in.
+* Transport is pluggable.
+* Memory and concurrency model strictly follows uvent coroutine scheduling.

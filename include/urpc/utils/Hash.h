@@ -6,10 +6,18 @@
 #define HASH_H
 
 #include <string_view>
+#include <type_traits>
 #include <cstdint>
 
 namespace urpc
 {
+
+    template <class T>
+    concept StringLike =
+        std::same_as<std::remove_cvref_t<T>, std::string> ||
+        std::same_as<std::remove_cvref_t<T>, std::string_view> ||
+        std::same_as<std::remove_cvref_t<T>, const char*>;
+
     constexpr uint64_t FNV_OFFSET = 1469598103934665603ull;
     constexpr uint64_t FNV_PRIME = 1099511628211ull;
 
@@ -40,6 +48,12 @@ namespace urpc
     consteval uint64_t method_id(const char (&str)[N])
     {
         return fnv1a64_ct(str);
+    }
+
+    template <StringLike T>
+    constexpr uint64_t method_id(T&& str)
+    {
+        return fnv1a64_rt(std::forward<std::string>(str));
     }
 }
 

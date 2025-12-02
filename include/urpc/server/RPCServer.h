@@ -17,16 +17,21 @@
 
 #include <ulog/ulog.h>
 
+#include <urpc/config/Config.h>
 #include <urpc/registry/RPCMethodRegistry.h>
 #include <urpc/connection/RPCConnection.h>
-#include <urpc/transport/TCPStream.h>
+#include <urpc/transport/IRPCStreamFactory.h>
 
 namespace urpc
 {
     class RpcServer
     {
     public:
-        RpcServer(std::string host, uint16_t port, int threads);
+        RpcServer(std::string host,
+                             uint16_t port,
+                             int threads);
+
+        explicit RpcServer(RpcServerConfig cfg);
 
         RpcMethodRegistry& registry();
 
@@ -52,10 +57,8 @@ namespace urpc
         usub::uvent::task::Awaitable<void> accept_loop();
 
     private:
-        std::string host_;
-        uint16_t port_;
-        int threads_;
         RpcMethodRegistry registry_;
+        RpcServerConfig config_;
     };
 }
 

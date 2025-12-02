@@ -12,6 +12,7 @@
 #include <uvent/sync/AsyncCancellation.h>
 
 #include <urpc/transport/IRPCStream.h>
+#include <urpc/transport/TlsPeer.h>
 
 namespace urpc
 {
@@ -22,6 +23,7 @@ namespace urpc
         uint64_t method_id;
         uint16_t flags;
         usub::uvent::sync::CancellationToken cancel_token;
+        const RpcPeerIdentity* peer{nullptr};
     };
 
     using RpcHandlerAwaitable = usub::uvent::task::Awaitable<void>;

@@ -8,6 +8,8 @@
 #include <uvent/utils/buffer/DynamicBuffer.h>
 #include <uvent/tasks/Awaitable.h>
 
+#include <urpc/transport/TlsPeer.h>
+
 namespace urpc
 {
     struct IRpcStream
@@ -17,6 +19,7 @@ namespace urpc
 
         virtual usub::uvent::task::Awaitable<ssize_t> async_write(
             uint8_t* data, size_t len) = 0;
+        [[nodiscard]] virtual const RpcPeerIdentity* peer_identity() const noexcept = 0;
 
         virtual void shutdown() = 0;
         virtual ~IRpcStream() = default;

@@ -12,20 +12,20 @@ namespace urpc
         buf.clear();
         buf.reserve(expected);
 
-        #if URPC_LOGS
-                    usub::ulog::debug(
-                        "RpcConnection::read_exact: cur={} expected={}",
-                        buf.size(), expected);
-        #endif
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcConnection::read_exact: cur={} expected={}",
+            buf.size(), expected);
+#endif
 
-                    ssize_t r = co_await stream.async_read(buf, expected);
-        #if URPC_LOGS
-                    usub::ulog::debug(
-                        "RpcConnection::read_exact: async_read r={} size={}",
-                        r, buf.size());
-        #endif
+        ssize_t r = co_await stream.async_read(buf, expected);
+#if URPC_LOGS
+        usub::ulog::debug(
+            "RpcConnection::read_exact: async_read r={} size={}",
+            r, buf.size());
+#endif
 
-        co_return true;
+        co_return r > 0;
     }
 
     RpcConnection::RpcConnection(std::shared_ptr<IRpcStream> stream,
@@ -36,7 +36,7 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::info(
             "RpcConnection ctor: stream_={}",
-            static_cast<void*>(stream_.get()));
+            static_cast<void*>(this->stream_.get()));
 #endif
     }
 
@@ -113,6 +113,8 @@ namespace urpc
                     "RpcConnection::loop: header size={} != {}, dropping",
                     head.size(), sizeof(RpcFrameHeader));
 #endif
+
+
                 this->stream_->shutdown();
                 break;
             }
@@ -361,13 +363,13 @@ namespace urpc
                 frame.header.stream_id);
 #endif
 
-
             RpcContext tmp{
                 .stream = *this->stream_,
                 .stream_id = frame.header.stream_id,
                 .method_id = frame.header.method_id,
                 .flags = frame.header.flags,
                 .cancel_token = usub::uvent::sync::CancellationToken{},
+                .peer = this->stream_->peer_identity(),
             };
 
             co_await this->send_simple_error(tmp, 404, "Unknown method");
@@ -387,6 +389,7 @@ namespace urpc
             .method_id = frame.header.method_id,
             .flags = frame.header.flags,
             .cancel_token = src->token(),
+            .peer = this->stream_->peer_identity(),
         };
 
         std::span<const uint8_t> body{

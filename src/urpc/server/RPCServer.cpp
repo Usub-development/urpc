@@ -1,21 +1,38 @@
 #include <chrono>
 
 #include <urpc/server/RPCServer.h>
+#include <urpc/transport/TCPStreamFactory.h>
 
 namespace urpc
 {
     RpcServer::RpcServer(std::string host,
                          uint16_t port,
                          int threads)
-        : host_(std::move(host))
-          , port_(port)
-          , threads_(threads)
+        : RpcServer(RpcServerConfig{
+            std::move(host),
+            port,
+            threads,
+            nullptr
+        })
+    {
+    }
+
+    RpcServer::RpcServer(RpcServerConfig cfg)
+        : registry_()
+          , config_(std::move(cfg))
     {
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer ctor host={} port={} threads={}",
-            this->host_, this->port_, this->threads_);
+            this->config_.host,
+            this->config_.port,
+            this->config_.threads);
 #endif
+        if (!this->config_.stream_factory)
+        {
+            this->config_.stream_factory =
+                std::make_shared<TcpRpcStreamFactory>();
+        }
     }
 
     RpcMethodRegistry& RpcServer::registry()
@@ -55,7 +72,9 @@ namespace urpc
         usub::ulog::info(
             "RpcServer::run_async starting accept_loop "
             "host={} port={} threads={}",
-            this->host_, this->port_, this->threads_);
+            this->config_.host,
+            this->config_.port,
+            this->config_.threads);
 #endif
         co_await this->accept_loop();
 #if URPC_LOGS
@@ -70,10 +89,10 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer::run starting with threads={}",
-            this->threads_);
+            this->config_.threads);
 #endif
 
-        usub::Uvent uvent(this->threads_);
+        usub::Uvent uvent(this->config_.threads);
 
 #if URPC_LOGS
         usub::ulog::debug(
@@ -95,11 +114,11 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer: creating TCPServerSocket on {}:{}",
-            this->host_, this->port_);
+            this->config_.host, this->config_.port);
 #endif
 
         net::TCPServerSocket acceptor{
-            this->host_.c_str(), this->port_
+            this->config_.host.c_str(), this->config_.port
         };
 
 #if URPC_LOGS
@@ -133,31 +152,31 @@ namespace urpc
             usub::ulog::info(
                 "RpcServer: got TCPClientSocket, fd={}",
                 soc->get_raw_header()->fd);
-
-            usub::ulog::info(
-                "RpcServer: BEFORE make_shared<TcpRpcStream>");
 #endif
 
-            auto stream = std::make_shared<TcpRpcStream>(
-                std::move(soc.value()));
+            if (!this->config_.stream_factory)
+            {
+                this->config_.stream_factory =
+                    std::make_shared<TcpRpcStreamFactory>();
+            }
 
+            auto stream =
+                co_await this->config_.stream_factory->create_server_stream(
+                    std::move(soc.value()));
+
+            if (!stream)
+            {
 #if URPC_LOGS
-            usub::ulog::info(
-                "RpcServer: AFTER make_shared<TcpRpcStream> stream={}",
-                static_cast<void*>(stream.get()));
-
-            usub::ulog::info(
-                "RpcServer: BEFORE make_shared<RpcConnection>");
+                usub::ulog::warn(
+                    "RpcServer: stream_factory returned nullptr, dropping connection");
 #endif
+                continue;
+            }
 
             auto conn = std::make_shared<RpcConnection>(
                 stream, this->registry_);
 
 #if URPC_LOGS
-            usub::ulog::info(
-                "RpcServer: AFTER make_shared<RpcConnection> conn={}",
-                static_cast<void*>(conn.get()));
-
             usub::ulog::info(
                 "RpcServer: BEFORE co_spawn(RpcConnection::run_detached), conn={}",
                 static_cast<void*>(conn.get()));

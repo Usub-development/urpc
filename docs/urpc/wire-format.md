@@ -1,128 +1,261 @@
 # Wire Format
 
-## Byte order
+uRPC uses a fixed **32-byte** binary header followed by an optional payload.
+All integers are **big-endian**.
 
-All multi-byte integer fields on the wire use **big-endian** (network byte order):
+The framing format is identical for TCP, TLS, and mTLS transports.
 
-* Conversion functions:
+---
 
-    * `host_to_be<T>(T)` converts host integer/enum to big-endian.
-    * `be_to_host<T>(T)` converts big-endian to host.
-* Applied to all integral fields in the header and error payload.
+# Byte order
 
-## Frame header
+All multi-byte integer fields are encoded as **big-endian** ("network byte order").
 
-On the wire the frame header is **28 bytes** long and has the following layout:
+Utility functions:
 
-|       Field | Type     | Size (bytes) | Endianness | Description                            |
-|------------:|----------|--------------|------------|----------------------------------------|
-|     `magic` | `uint32` | 4            | BE         | Magic constant `'URPC'` = `0x55525043` |
-|   `version` | `uint8`  | 1            | —          | Protocol version (currently `1`)       |
-|      `type` | `uint8`  | 1            | —          | Frame type (`FrameType`)               |
-|     `flags` | `uint16` | 2            | BE         | Bitmask of `FrameFlags`                |
-| `stream_id` | `uint32` | 4            | BE         | Logical stream identifier              |
-| `method_id` | `uint64` | 8            | BE         | Numeric method identifier              |
-|    `length` | `uint32` | 4            | BE         | Payload length in bytes                |
+```cpp
+host_to_be<T>(T value)
+be_to_host<T>(T value)
+```
 
-The C++ struct `RpcFrameHeader` has an additional `reserved` field and compiler padding, hence
-`sizeof(RpcFrameHeader) == 32`, but **`reserved` is not present on the wire and must be ignored** when (de)serializing.
+Applied to:
 
-### Magic and version
+* all integers in the header
+* all integers in the error payload
 
-* `magic` must be exactly `0x55525043` (`'U' 'R' 'P' 'C'`).
-* `version` must be `1` for the current implementation.
-* Both client and server validate:
+---
 
-    * If `magic != 0x55525043` or `version != 1`, the connection is closed.
+# Frame header (32 bytes)
 
-### Frame types
+The wire header is always **exactly 32 bytes**:
 
-Declared in `FrameType`:
+| Field     | Type   | Size | Endianness | Description                                |
+|-----------|--------|------|------------|--------------------------------------------|
+| magic     | uint32 | 4    | BE         | `'URPC'` = `0x55525043`                    |
+| version   | uint8  | 1    | —          | Protocol version (`1`)                     |
+| type      | uint8  | 1    | —          | FrameType (Request/Response/Ping/...)      |
+| flags     | uint16 | 2    | BE         | FrameFlags bitmask                         |
+| reserved  | uint32 | 4    | BE         | Must be `0`; reserved for future extension |
+| stream_id | uint32 | 4    | BE         | Logical RPC stream ID                      |
+| method_id | uint64 | 8    | BE         | Numeric method ID (64-bit hash)            |
+| length    | uint32 | 4    | BE         | Payload length in bytes                    |
+
+Total: **32 bytes**
+
+### Notes
+
+* `reserved` is **present on the wire** and must be written as zero.
+* The C++ struct `RpcFrameHeader` also has size 32, so serialization/deserialization maps 1:1 to the actual wire format.
+* Any frame with invalid magic/version causes the connection to close immediately.
+
+---
+
+# Frame types
 
 ```cpp
 enum class FrameType : uint8_t
 {
     Request  = 0,
     Response = 1,
-    Stream   = 2,
+    Stream   = 2, // reserved
     Cancel   = 3,
     Ping     = 4,
     Pong     = 5,
 };
 ```
 
-Semantics:
+Meaning:
 
-* **Request** – Client → Server: start an RPC.
-* **Response** – Server → Client: final result (success or error).
-* **Stream** – Reserved for future streaming use (not used currently).
-* **Cancel** – Client → Server: request cancellation of running RPC.
-* **Ping** – Either direction: liveness probe.
-* **Pong** – Reply to `Ping`, mirrors `stream_id` and `method_id`.
+* **Request** — client → server: start a new RPC
+* **Response** — server → client: final result (success or error)
+* **Stream** — reserved, unused
+* **Cancel** — client → server: cancel an in-flight RPC
+* **Ping** — health probe (either direction)
+* **Pong** — reply to Ping, mirrors stream_id/method_id
 
-### Flags
+---
 
-Declared as `FrameFlags` bitmask:
+# Flags
 
 ```cpp
 enum FrameFlags : uint8_t
 {
-    FLAG_END_STREAM  = 0x01,
-    FLAG_ERROR       = 0x02,
-    FLAG_COMPRESSED  = 0x04,
+    FLAG_END_STREAM = 0x01,
+    FLAG_ERROR      = 0x02,
+    FLAG_COMPRESSED = 0x04,
 };
 ```
 
-Currently used:
+### Currently used:
 
-* `FLAG_END_STREAM`:
+* **FLAG_END_STREAM**
 
-    * For `Request` and `Response` frames: marks that the sender will not send further frames for this stream.
-    * All existing Request/Response/Ping/Pong production frames set `FLAG_END_STREAM`.
-* `FLAG_ERROR`:
+    * Set on all Request, Response, Ping, Pong.
+    * Indicates no more frames for this stream.
 
-    * Only meaningful on `Response`.
-    * If set, the payload is an **error payload** (see below).
-* `FLAG_COMPRESSED`:
+* **FLAG_ERROR**
 
-    * Reserved for future compressed payload support.
-    * Not used yet; must be ignored by receivers.
+    * Only meaningful on Response.
+    * Payload becomes a binary *error payload* (see below).
 
-### Payload
+* **FLAG_COMPRESSED**
 
-Immediately follows the 28-byte header:
+    * Reserved for future use.
+    * Must be ignored by receivers.
 
-* Size is `length` bytes.
-* May be zero (`length == 0`).
+---
 
-Types:
+# Payload
 
-* `Request` payload:
+Payload immediately follows the 32-byte header.
 
-    * Arbitrary binary request body, interpreted by the method implementation.
-* `Response` payload:
+```
++-------------------+-----------------------------+
+| 32-byte header    | payload[ length ]           |
++-------------------+-----------------------------+
+```
 
-    * If `FLAG_ERROR` is **not** set: arbitrary binary response body.
-    * If `FLAG_ERROR` **is** set: error payload (see below).
-* `Cancel`, `Ping`, `Pong`:
+* If `length == 0`, no payload is present.
+* Payload is **opaque**; protocol does not impose a serialization format.
 
-    * Current implementation uses an empty payload (`length == 0`).
+### Payload by type
 
-### Error payload format
+| Type      | Meaning                   |
+|-----------|---------------------------|
+| Request   | Binary request body       |
+| Response  | Success or error payload  |
+| Ping/Pong | No payload (`length = 0`) |
+| Cancel    | No payload (`length = 0`) |
+| Stream    | Reserved                  |
 
-When `FrameType::Response` and `FLAG_ERROR` is set, payload has the following binary format:
+---
 
-| Offset | Field         | Type      | Size | Endianness | Description                    |
-|-------:|---------------|-----------|------|------------|--------------------------------|
-|      0 | `code`        | `uint32`  | 4    | BE         | Application error code         |
-|      4 | `message_len` | `uint32`  | 4    | BE         | Length of UTF-8 error message  |
-|      8 | `message`     | `char[]`  | N    | —          | Error message bytes            |
-|    8+N | `details`     | `uint8[]` | M    | —          | Optional opaque binary details |
+# Error payload
+
+If:
+
+```
+type == Response
+flags has FLAG_ERROR
+```
+
+Then payload contains a binary error structure:
+
+| Offset | Field   | Type    | Size | Endianness | Description                    |
+|-------:|---------|---------|------|------------|--------------------------------|
+|      0 | code    | uint32  | 4    | BE         | Application error code         |
+|      4 | msg_len | uint32  | 4    | BE         | UTF-8 message length           |
+|      8 | message | char[]  | N    | —          | Human-readable message         |
+|    8+N | details | uint8[] | M    | —          | Optional opaque binary details |
 
 Constraints:
 
 * `payload.size() >= 8`
-* `payload.size() >= 8 + message_len`
+* `payload.size() >= 8 + msg_len`
 
-Server builds this format in `RpcConnection::send_simple_error()`, and client decodes it in
-`RpcClient::parse_error_payload()`.
+### Construction
+
+Server builds this in:
+
+```
+RpcConnection::send_simple_error()
+```
+
+Client parses this in:
+
+```
+RpcClient::parse_error_payload()
+```
+
+If error is detected:
+
+* `call->error = true`
+* `call->response` remains empty
+
+---
+
+# Ping / Pong frames
+
+Used by `RpcClient::async_ping()` and `RpcConnection::handle_ping()`.
+
+### Ping
+
+```
+type      = Ping
+flags     = END_STREAM
+stream_id = unique non-zero id
+method_id = 0
+length    = 0
+payload   = empty
+```
+
+### Pong
+
+```
+type      = Pong
+flags     = END_STREAM
+stream_id = same as Ping
+method_id = same as Ping
+length    = 0
+payload   = empty
+```
+
+---
+
+# Stream IDs
+
+* 32-bit unsigned integer.
+* `0` is reserved.
+* Client assigns stream IDs sequentially using atomic counter.
+* Response always uses the same `stream_id` as its Request.
+* When `END_STREAM` is set, the logical stream is closed.
+
+---
+
+# Method IDs
+
+Method IDs are 64-bit hashes (FNV-1a). Same value is used:
+
+* in Request header
+* in Response header
+
+Two ways to produce them:
+
+### Runtime
+
+```cpp
+uint64_t id = fnv1a64_rt("Example.Echo");
+```
+
+Used by:
+
+```
+client->async_call("Example.Echo", ...)
+server.register_method("Example.Echo", ...)
+```
+
+### Compile-time
+
+```cpp
+constexpr uint64_t EchoId = method_id("Example.Echo");
+```
+
+Used by:
+
+```
+client->async_call_ct<EchoId>(...)
+server.register_method_ct<EchoId>(...)
+```
+
+Compile-time IDs guarantee an identical constant across client/server.
+
+---
+
+# Summary
+
+* uRPC’s wire format is a simple **32-byte header** + binary payload.
+* All multibyte integers are **big-endian**.
+* Transport layer (TCP/TLS/mTLS) does not change framing.
+* Error semantics are fully binary.
+* Ping/Pong uses standard frames; no side channels exist.
+* Protocol is designed to be trivially parsed and extremely fast.

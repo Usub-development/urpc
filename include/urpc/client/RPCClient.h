@@ -22,9 +22,10 @@
 
 #include <ulog/ulog.h>
 
+#include <urpc/config/Config.h>
 #include <urpc/datatypes/Frame.h>
+#include <urpc/transport/IRPCStream.h>
 #include <urpc/transport/IOOps.h>
-#include <urpc/transport/TCPStream.h>
 #include <urpc/utils/Hash.h>
 
 namespace urpc
@@ -42,6 +43,8 @@ namespace urpc
     {
     public:
         RpcClient(std::string host, uint16_t port);
+
+        explicit RpcClient(RpcClientConfig cfg);
 
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call(
             uint64_t method_id,
@@ -78,8 +81,7 @@ namespace urpc
         void close();
 
     private:
-        std::string host_;
-        uint16_t port_;
+        RpcClientConfig config_;
 
         std::shared_ptr<IRpcStream> stream_;
 

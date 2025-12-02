@@ -1,55 +1,190 @@
 # uRPC Protocol
 
-uRPC is a compact binary RPC protocol built on top of a generic async byte stream. It is designed for:
+uRPC is a compact binary RPC protocol running over a generic asynchronous byte
+stream. The transport layer is abstracted through `IRpcStream`, allowing multiple
+backends:
 
-* Low overhead (fixed 28-byte header, no text encoding).
-* Easy integration with C++ coroutines (via **uvent**).
-* Extensibility (frame types, flags, reserved fields, versioning).
+- TCP (`TcpRpcStream`)
+- TLS (`TlsRpcStream`)
+- mTLS (mutual TLS)
+- Any custom transport implementing the interface
 
-This document describes the protocol as implemented in the `urpc` library:
+The protocol is designed for:
 
-* Wire format (frames, headers, byte order).
-* Message types, flags, and semantics.
-* Client and server behaviour.
-* Error, ping/pong, and cancellation semantics.
-* Mapping between method names and numeric IDs.
+* Low overhead (fixed 32-byte header, big-endian encoding)
+* Full multiplexing over a single connection
+* Efficient coroutine-based processing (via **uvent**)
+* Extensibility through frame types, flags, and open versioning
 
-## High-level concepts
+This documentation covers:
 
-* **Connection** – a long-lived bidirectional byte stream (typically a TCP connection).
-* **Stream** – a logical RPC exchange inside a connection, identified by `stream_id` (32-bit).
-* **Frame** – a single protocol message; always starts with a fixed header, followed by an optional payload.
-* **Method** – a remotely callable function identified by a 64-bit `method_id` (an FNV-1a hash of the method name by default).
+* Wire format
+* Frame types and semantics
+* Method identification
+* Client and server behaviour
+* Ping/pong and cancellation
+* TLS and mTLS usage
 
-### Basic RPC lifecycle
+---
 
-1. Client connects to the server using a `TcpRpcStream` (or any `IRpcStream` implementation).
+# High-Level Concepts
+
+### **Connection**
+
+A long-lived bidirectional byte stream (TCP, TLS, mTLS, or user-defined).
+
+### **Stream**
+
+A logical RPC exchange within a connection, identified by a `stream_id`:
+
+- `stream_id != 0`
+- Multiple concurrent RPCs are multiplexed on the same underlying transport.
+
+### **Frame**
+
+A single protocol message:
+
+```
+
++-------------------+-----------------------------+
+| Fixed Header      | Payload (binary, length N) |
++-------------------+-----------------------------+
+
+```
+
+Always starts with a 32-byte header, followed by an optional payload.
+
+### **Method**
+
+A remotely callable function identified by a 64-bit numeric ID:
+
+```
+
+method_id = fnv1a64("Service.Method")
+
+```
+
+The server uses this ID to look up the registered handler.
+
+---
+
+# Basic RPC Lifecycle
+
+1. Client creates a stream:
+    - `TcpRpcStream` (plain TCP)
+    - `TlsRpcStream` (TLS)
+    - `TlsRpcStream` + client cert (mTLS)
+    - Custom `IRpcStream`
+
+   Transport selection is done through `RpcClientConfig.stream_factory`.
+
 2. Client sends a **Request** frame:
+    - `type = Request`
+    - Non-zero `stream_id`
+    - `method_id = fnv1a64(name)`
+    - Payload = binary request body
 
-    * `type = Request`
-    * New `stream_id != 0`
-    * `method_id` set to the target method
-    * `payload` contains the serialized request body.
 3. Server’s `RpcConnection` loop:
+    - Reads and parses the frame
+    - Finds handler in `RpcMethodRegistry`
+    - Invokes handler coroutine:
+      ```cpp
+      Awaitable<std::vector<uint8_t>>(RpcContext&, std::span<const uint8_t>)
+      ```
 
-    * Reads the header and payload.
-    * Looks up the handler in `RpcMethodRegistry` by `method_id`.
-    * Invokes the handler coroutine with an `RpcContext` and the request payload.
-4. Handler returns a `std::vector<uint8_t>` response body.
+4. Handler returns binary response.
+
 5. Server sends a **Response** frame:
+    - Same `stream_id`
+    - Same `method_id`
+    - Payload = response bytes
 
-    * `type = Response`
-    * Same `stream_id` and `method_id`.
-    * `payload` contains the serialized response body.
-6. Client’s `RpcClient` reader loop:
+6. Client’s `RpcClient` matches the response by `stream_id` and resumes the awaiting coroutine.
 
-    * Matches the Response by `stream_id`.
-    * Fulfils the pending call’s `AsyncEvent`.
-    * Returns the response bytes to the caller.
+---
 
-### Concurrency model
+# Concurrency Model
 
-* A single connection may carry multiple concurrent RPCs, each with its own `stream_id`.
-* Client uses `RpcClient::next_stream_id_` (atomic) to allocate stream IDs.
-* Writes are serialized with an async mutex (`write_mutex_`) on both client and server.
-* Server uses `RpcConnection` per accepted connection; each connection runs its own read loop coroutine.
+* A single TCP/TLS connection carries many parallel RPCs.
+* Client allocates stream IDs using an atomic counter.
+* All writes are serialized with an async mutex (`write_mutex_`) to preserve framing.
+* Server creates one `RpcConnection` per accepted socket.
+* Each connection has its own read loop coroutine.
+* All handlers run concurrently.
+
+This design eliminates head-of-line blocking inside the protocol layer.
+
+---
+
+# Transport Layer (TCP/TLS/mTLS)
+
+Transport is pluggable. The client/server receive a factory:
+
+```cpp
+std::shared_ptr<IRpcStreamFactory> stream_factory;
+```
+
+Built-in factories:
+
+| Factory               | Transport |
+|-----------------------|-----------|
+| `TcpRpcStreamFactory` | TCP       |
+| `TlsRpcStreamFactory` | TLS/mTLS  |
+
+`TlsRpcStreamFactory` configures:
+
+* CA verification
+* Server certificate verification (SNI)
+* Optional client certificate (mTLS)
+* TLS handshake done inside stream
+
+Server-side factory enables TLS or mTLS by providing certificates and CA.
+
+---
+
+# CLI Tool
+
+The repository includes `urpc_cli`, a minimal command-line client using the same protocol.
+
+Examples:
+
+### Plain TCP
+
+```
+urpc_cli --host 127.0.0.1 --port 45900 \
+         --method Example.Echo \
+         --data "hello"
+```
+
+### TLS
+
+```
+urpc_cli --tls --tls-ca ca.crt \
+         --tls-server-name localhost \
+         --host 127.0.0.1 --port 45900 \
+         --method Example.Echo --data "hello"
+```
+
+### mTLS
+
+```
+urpc_cli --tls \
+         --tls-ca ca.crt \
+         --tls-cert client.crt \
+         --tls-key client.key \
+         --tls-server-name localhost \
+         --host 127.0.0.1 --port 45900 \
+         --method Example.Echo \
+         --data "hello secure"
+```
+
+---
+
+# Next Sections
+
+* [wire-format.md](wire-format.md) — Header layout, frame types, flags
+* [transport-and-ids.md](transport-and-ids.md) — Method IDs, connection rules
+* [client.md](client.md) — Reader loop, stream allocation, ping/pong
+* [server.md](server.md) — Accept loop, handler invocation, shutdown
+
+```

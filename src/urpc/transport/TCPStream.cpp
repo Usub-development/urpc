@@ -41,6 +41,10 @@ namespace urpc
 #endif
         co_return co_await this->socket_.async_write(data, len);
     }
+    const RpcPeerIdentity* TcpRpcStream::peer_identity() const noexcept
+    {
+        return nullptr;
+    }
 
     void TcpRpcStream::shutdown()
     {

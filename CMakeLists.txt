@@ -12,10 +12,12 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 
 option(URPC_LOGS "Use URPC_LOGS" ON)
+option(URPC_BUILD_CLI "Build urpc_cli command-line tool" ON)
 
-add_compile_definitions(DEV_STAGE=${DEV_STAGE})
+message(STATUS "URPC_LOGS = ${URPC_LOGS}")
+message(STATUS "URPC_BUILD_CLI = ${URPC_BUILD_CLI}")
 
-message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
+find_package(OpenSSL REQUIRED)
 
 include(CTest)
 include(FetchContent)
@@ -53,6 +55,8 @@ target_link_libraries(urpc
         PUBLIC
         usub::uvent
         usub::ureflect
+        OpenSSL::Crypto
+        OpenSSL::SSL
 )
 
 if (URPC_LOGS)
@@ -66,6 +70,26 @@ if (URPC_LOGS)
             PUBLIC
             usub::ulog
     )
+endif ()
+
+if (URPC_BUILD_CLI)
+    FetchContent_Declare(
+            ulog
+            GIT_REPOSITORY https://github.com/Usub-development/ulog.git
+            GIT_TAG main
+    )
+    FetchContent_MakeAvailable(ulog)
+    target_link_libraries(urpc
+            PUBLIC
+            usub::ulog
+    )
+
+    add_executable(urpc_cli bin/urpc_cli.cpp)
+    target_link_libraries(urpc_cli PRIVATE urpc usub::ulog)
+    target_compile_definitions(urpc_cli PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    install(TARGETS urpc_cli
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif ()
 
 target_compile_definitions(urpc PUBLIC
@@ -83,6 +107,10 @@ if (URPC_BUILD_EXAMPLES)
     add_executable(urpc_example examples/main.cpp)
     target_link_libraries(urpc_example PRIVATE urpc)
     target_compile_definitions(urpc_example PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_server_mtls examples/main_server_mtls.cpp)
+    target_link_libraries(urpc_example_server_mtls PRIVATE urpc)
+    target_compile_definitions(urpc_example_server_mtls PRIVATE DEV_STAGE=${DEV_STAGE})
 
     add_executable(urpc_example_client examples/main_client.cpp)
     target_link_libraries(urpc_example_client PRIVATE urpc)
@@ -164,14 +192,14 @@ if (BUILD_TESTING AND URPC_BUILD_TESTS)
 
     file(GLOB_RECURSE URPC_TESTS CONFIGURE_DEPENDS tests/*.cpp)
 
-#    add_executable(urpc_tests ${URPC_TESTS})
-#    target_link_libraries(urpc_tests PRIVATE urpc ${GTest_LIBS})
-#    target_compile_definitions(urpc_tests PRIVATE DEV_STAGE=${DEV_STAGE})
-#    target_compile_features(urpc_tests PRIVATE cxx_std_23)
-#
-#    include(GoogleTest)
-#    gtest_discover_tests(urpc_tests
-#            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-#            DISCOVERY_TIMEOUT 60
-#    )
+    #    add_executable(urpc_tests ${URPC_TESTS})
+    #    target_link_libraries(urpc_tests PRIVATE urpc ${GTest_LIBS})
+    #    target_compile_definitions(urpc_tests PRIVATE DEV_STAGE=${DEV_STAGE})
+    #    target_compile_features(urpc_tests PRIVATE cxx_std_23)
+    #
+    #    include(GoogleTest)
+    #    gtest_discover_tests(urpc_tests
+    #            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    #            DISCOVERY_TIMEOUT 60
+    #    )
 endif ()

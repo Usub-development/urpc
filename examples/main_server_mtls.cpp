@@ -1,5 +1,3 @@
-// main_server.cpp
-
 #include "uvent/Uvent.h"
 #include "uvent/system/SystemContext.h"
 
@@ -7,6 +5,8 @@
 
 #include <urpc/server/RPCServer.h>
 #include <urpc/utils/Hash.h>
+#include <urpc/transport/TlsConfig.h>
+#include <urpc/transport/TlsRpcStreamFactory.h>
 
 using namespace usub;
 using namespace usub::uvent;
@@ -33,25 +33,52 @@ int main()
     usub::ulog::init(cfg);
     ulog::info("SERVER: logger initialized");
 
-    urpc::RpcServerConfig config {
-        .host = "0.0.0.0",
-        .port = 45900
+    urpc::TlsServerConfig tls_server_cfg{
+        .enabled = true,
+        .require_client_cert = true,
+        .ca_cert_file = "../certs/ca.crt",
+        .server_cert_file = "../certs/server.crt",
+        .server_key_file = "../certs/server.key"
     };
+
+    urpc::TlsClientConfig dummy_client_cfg{};
+    auto tls_factory =
+        std::make_shared<urpc::TlsRpcStreamFactory>(dummy_client_cfg);
+    tls_factory->set_server_cfg(tls_server_cfg);
+
+    urpc::RpcServerConfig config{
+        .host = "0.0.0.0",
+        .port = 45900,
+        .threads = 1,
+        .stream_factory = tls_factory
+    };
+
     urpc::RpcServer server{config};
-    ulog::info("SERVER: RpcServer created");
+    ulog::info("SERVER: RpcServer created (mTLS enabled)");
 
     server.register_method_ct<urpc::method_id("Example.Echo")>(
         [](urpc::RpcContext& ctx,
            std::span<const uint8_t> body)
         -> task::Awaitable<std::vector<uint8_t>>
         {
+            if (ctx.peer)
+            {
+                ulog::info(
+                    "SERVER: Example.Echo from peer: auth={} cn='{}' subject='{}'",
+                    ctx.peer->authenticated,
+                    ctx.peer->common_name,
+                    ctx.peer->subject);
+            }
+            else
+            {
+                ulog::info("SERVER: Example.Echo from peer: <no TLS identity>");
+            }
+
             ulog::info("SERVER: Example.Echo called, body_size={}", body.size());
 
             std::vector<uint8_t> out(body.begin(), body.end());
-
             co_return out;
         });
-
 
     ulog::info("SERVER: calling server.run()");
     server.run();

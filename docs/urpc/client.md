@@ -1,216 +1,303 @@
 # Client Behaviour
 
-This section describes how `RpcClient` uses the wire protocol.
+This section describes how `RpcClient` works, including TCP, TLS, and mTLS modes.
 
-## RpcClient structure
+---
+
+# Overview
+
+`RpcClient` is a fully asynchronous, multiplexed RPC client built on top of `uvent`.  
+Transport is abstracted via the `IRpcStream` interface, so the client supports:
+
+- **TCP** (`TcpRpcStream`)
+- **TLS** (`TlsRpcStream`)
+- **mTLS** (mutual TLS)
+
+Transport is selected through `RpcClientConfig.stream_factory`.
+
+---
+
+# Internal Structure
 
 Key members:
 
-* `std::shared_ptr<IRpcStream> stream_` – active transport.
+* `std::shared_ptr<IRpcStream> stream_` – active transport (TCP/TLS/mTLS).
 * `std::atomic<uint32_t> next_stream_id_{1}` – stream ID allocator.
-* `std::atomic<bool> running_{false}` – reader loop control flag.
+* `std::atomic<bool> running_{false}` – reader loop flag.
 * `AsyncMutex write_mutex_` – serialize writes.
-* `AsyncMutex connect_mutex_` – serialize connect attempts.
-* `AsyncMutex pending_mutex_` – protect `pending_calls_`.
-* `AsyncMutex ping_mutex_` – protect `ping_waiters_`.
-* `std::unordered_map<uint32_t, std::shared_ptr<PendingCall>> pending_calls_`
-* `std::unordered_map<uint32_t, std::shared_ptr<AsyncEvent>> ping_waiters_`
+* `AsyncMutex connect_mutex_` – serialize connects.
+* `AsyncMutex pending_mutex_` – protect RPC calls map.
+* `AsyncMutex ping_mutex_` – protect ping waiters.
+* `unordered_map<uint32_t, shared_ptr<PendingCall>> pending_calls_`
+* `unordered_map<uint32_t, shared_ptr<AsyncEvent>> ping_waiters_`
 
 `PendingCall`:
 
 ```cpp
-struct PendingCall
-{
+struct PendingCall {
     std::shared_ptr<AsyncEvent> event;
     std::vector<uint8_t> response;
-    bool     error{false};
-    uint32_t error_code{0};
+    bool        error{false};
+    uint32_t    error_code{0};
     std::string error_message;
 };
 ```
 
-## Establishing a connection
+---
+
+# Connection Establishment
 
 `RpcClient::ensure_connected()`:
 
-1. If `stream_` is non-null and `running_ == true`, it returns `true`.
-2. Acquires `connect_mutex_` to avoid concurrent connect attempts.
-3. Creates a `net::TCPClientSocket`.
-4. Calls `async_connect(host_, port_)`.
-5. On success:
+1. If already connected (`stream_ != nullptr` and `running_ == true`)
+   → returns `true`.
 
-* Wraps the socket in `TcpRpcStream`.
-* Stores it into `stream_`.
-* Sets `running_ = true`.
-* Spawns the `reader_loop()` coroutine via `system::co_spawn`.
+2. Locks `connect_mutex_`.
 
-If `async_connect` fails, `ensure_connected()` returns `false`.
+3. Creates a stream via:
 
-## Sending a request
-
-`RpcClient::async_call(uint64_t method_id, std::span<const uint8_t> request_body)`:
-
-1. Calls `ensure_connected()`. On failure returns an empty vector.
-2. Allocates a new `stream_id`:
-
-* `sid = next_stream_id_.fetch_add(1)`, skipping `0`.
-
-3. Creates a `PendingCall`:
-
-* With `AsyncEvent` (manual reset, initially unsignalled).
-* Inserts it into `pending_calls_[sid]` under `pending_mutex_`.
-
-4. Builds `RpcFrameHeader`:
-
-* `magic = 0x55525043`
-* `version = 1`
-* `type = FrameType::Request`
-* `flags = FLAG_END_STREAM`
-* `stream_id = sid`
-* `method_id = method_id`
-* `length = request_body.size()`
-
-5. Acquires `write_mutex_`.
-6. Copies `stream_` to a local shared pointer and verifies it’s non-null.
-7. Sends the frame using `send_frame(*stream, hdr, request_body)`.
-
-* On send failure: removes `pending_calls_[sid]` and returns empty vector.
-
-8. Waits on `call->event->wait()`.
-9. After wakeup:
-
-* Removes `pending_calls_[sid]` under `pending_mutex_`.
-* If `call->error == true`, returns empty vector.
-* Otherwise returns `call->response`.
-
-### Name-based and compile-time method IDs
-
-Helpers:
-
-```cpp
-template <size_t N>
-Awaitable<std::vector<uint8_t>> async_call(
-const char (&name)[N],
-std::span<const uint8_t> request_body);
-
-template <uint64_t MethodId>
-Awaitable<std::vector<uint8_t>> async_call_ct(
-std::span<const uint8_t> request_body);
+```
+config.stream_factory->create_client_stream(host, port)
 ```
 
-* `async_call(name, ...)`:
+Depending on factory:
 
-* Computes `method_id = fnv1a64_rt(std::string_view{name, N - 1})` at runtime.
-* `async_call_ct<MethodId>(...)`:
+| Factory               | Transport |
+|-----------------------|-----------|
+| `TcpRpcStreamFactory` | TCP       |
+| `TlsRpcStreamFactory` | TLS/mTLS  |
 
-* Uses a compile-time constant `MethodId` (usually produced by `method_id("...")`).
+4. On success:
 
-## Reader loop
+* `stream_ = created stream`
+* `running_ = true`
+* spawns `reader_loop()` via `co_spawn`
 
-`RpcClient::reader_loop()`:
+5. On failure: returns `false`.
 
-1. Runs while `running_ == true`.
-2. Captures `stream_` into local variable; if null, exits.
-3. Reads header:
+For TLS/mTLS:
 
-* Calls `read_exact(*stream, head_buffer, sizeof(RpcFrameHeader))`.
-* On failure or wrong size, exits loop.
+* handshake happens **inside** `TlsRpcStream`
+* certificate verification is performed according to config
 
-4. Parses header bytes using `parse_header()`.
+---
 
-* Validates `magic` and `version`. On mismatch, exits.
+# Sending Requests
 
-5. If `hdr.length > 0`, reads payload into `frame.payload` with `read_exact`.
+`RpcClient::async_call(method_id, request_body)`:
 
-* On failure or size mismatch, exits.
+1. `ensure_connected()`
 
-6. Dispatches by `FrameType`:
+    * if fails → returns empty vector
 
-### Handling Response
+2. Allocates new non-zero `stream_id`.
 
-* Looks up `PendingCall` by `frame.header.stream_id` under `pending_mutex_`.
-* If not found, logs a warning and ignores.
-* Checks `FLAG_ERROR`:
+3. Creates `PendingCall` with `AsyncEvent` and inserts it under `pending_mutex_`.
 
-* If set:
+4. Builds `RpcFrameHeader`.
 
-* Calls `parse_error_payload(frame.payload, code, msg)`.
-* Populates `call->error`, `call->error_code`, `call->error_message`.
-* If not set:
+5. Locks `write_mutex_` and sends frame via:
 
-* Copies payload bytes into `call->response`.
-* Sets `call->error = false`.
-* Signals `call->event->set()`.
+```
+send_frame(*stream_, header, request_body)
+```
 
-### Handling Ping
+6. Waits on `call->event->wait()`.
 
-* Builds a `Pong` response:
+7. Removes entry from `pending_calls_`.
 
-* Same `stream_id` and `method_id`.
-* `type = FrameType::Pong`
-* `flags = FLAG_END_STREAM`
-* `length = 0`
+8. Returns either:
 
-* Under `write_mutex_`, sends the pong via `send_frame`.
+    * `call->response`
+    * empty vector if `call->error == true`
 
-### Handling Pong
+## Name-based and compile-time helpers
 
-* Looks up `AsyncEvent` in `ping_waiters_` by `stream_id` under `ping_mutex_`.
-* If found, calls `evt->set()`.
+```cpp
+client->async_call("Service.Method", body);
+client->async_call_ct<method_id("Service.Method")>(body);
+```
 
-### Other types
+* First computes hash at runtime.
+* Second uses compile-time hash.
 
-* `Request`, `Stream`, `Cancel` and unknown types from the server are logged and ignored by the client.
+---
 
-### Loop termination
+# Reader Loop
 
-On exit from the loop:
+`RpcClient::reader_loop()` continuously:
 
-* Sets `running_ = false`.
-* Under `pending_mutex_`:
+1. Captures `stream_`.
+   If null → exit.
 
-* Marks all pending calls as errored with `"Connection closed"`.
-* Sets their events.
-* Clears `pending_calls_`.
-* Under `ping_mutex_`:
+2. Reads header via `read_exact`.
+   EOF or error → exit.
 
-* Sets all pending ping events.
-* Clears `ping_waiters_`.
-* Under `connect_mutex_`:
+3. Parses header.
+   Invalid magic/version → exit.
 
-* Resets `stream_` to `nullptr`.
+4. Reads payload (`hdr.length > 0`).
 
-## Ping / Pong API
+5. Dispatches by `FrameType`:
 
-`RpcClient::async_ping()`:
+---
 
-1. Calls `ensure_connected()`. On failure returns `false`.
+## Response Frames
 
-2. Allocates `sid` using `next_stream_id_`.
+* Lookup `PendingCall` by `stream_id`.
+* If not found → ignore.
+* If `FLAG_ERROR`:
 
-3. Creates `AsyncEvent`, inserts into `ping_waiters_[sid]` under `ping_mutex_`.
+    * decode error payload
+    * set `call->error = true`
+    * copy `error_code`, `error_message`
+* Else:
 
-4. Builds header:
+    * copy payload into `call->response`
+* Trigger `call->event->set()`.
 
-* `type = FrameType::Ping`
-* `flags = FLAG_END_STREAM`
-* `stream_id = sid`
-* `method_id = 0`
-* `length = 0`
+---
 
-5. Sends frame under `write_mutex_`.
+## Ping Frames
 
-6. Waits on `evt->wait()`.
+Client never receives application-level pings in normal flow, but supports it:
 
-7. Under `ping_mutex_`, checks if `ping_waiters_` still contains `sid`.
+* Build a Pong
+* Send under `write_mutex_`
 
-* If yes: removes it and returns `true`.
-* Otherwise returns `false`.
+---
 
-## Closing the client
+## Pong Frames
+
+* Lookup waiter in `ping_waiters_`
+* If found → trigger event
+
+---
+
+## Unknown or server-side frames
+
+* Logged
+* Ignored
+
+---
+
+# Loop Termination
+
+When the loop exits:
+
+1. `running_ = false`
+
+2. For all pending RPCs:
+
+    * mark error `"Connection closed"`
+    * trigger events
+
+3. For all ping waiters:
+
+    * trigger events
+
+4. Reset `stream_ = nullptr` under `connect_mutex_`
+
+This guarantees that all awaiting coroutines wake up.
+
+---
+
+# Ping / Pong
+
+`async_ping()` is a lightweight API-level liveness probe:
+
+1. `ensure_connected()`
+2. Allocate `sid`
+3. Insert `AsyncEvent` into `ping_waiters_`
+4. Send Ping frame
+5. Wait on event
+6. If waiter still exists → success
+
+Useful for:
+
+* keep-alive
+* connection warm-up
+* readiness checks
+
+---
+
+# Closing the Client
 
 `RpcClient::close()`:
 
-* Sets `running_ = false`.
-* Swaps out `stream_` into a local variable and calls `stream->shutdown()` if present.
-* The reader loop will eventually exit and perform cleanup described above.
+* sets `running_ = false`
+* swaps out `stream_`
+* calls `stream->shutdown()`
+* reader loop terminates and performs cleanup
+
+This is a **graceful** shutdown, not an error.
+
+---
+
+# TLS and mTLS Support
+
+TLS is activated by selecting `TlsRpcStreamFactory`:
+
+```cpp
+urpc::RpcClientConfig cfg;
+cfg.host = "server";
+cfg.port = 45900;
+
+urpc::TlsClientConfig tls;
+tls.enable = true;
+tls.verify_peer = true;
+tls.ca_file = "ca.crt";
+tls.cert_file = "client.crt"; // optional
+tls.key_file = "client.key";   // optional
+tls.server_name = "localhost"; // SNI
+
+cfg.stream_factory = std::make_shared<TlsRpcStreamFactory>(tls);
+
+RpcClient client{cfg};
+```
+
+mTLS requires:
+
+* `verify_peer = true`
+* client certificate + key
+
+The rest of the client logic is identical.
+
+---
+
+# CLI Tool
+
+The repository includes a simple CLI client (`urpc_cli`) using the same API.
+
+Examples:
+
+### TCP
+
+```
+urpc_cli --host 127.0.0.1 --port 45900 \
+         --method Example.Echo \
+         --data "hello"
+```
+
+### TLS
+
+```
+urpc_cli --tls --tls-ca ca.crt \
+         --tls-server-name localhost \
+         --host 127.0.0.1 --port 45900 \
+         --method Example.Echo --data "hello"
+```
+
+### mTLS
+
+```
+urpc_cli --tls \
+         --tls-ca ca.crt \
+         --tls-cert client.crt \
+         --tls-key client.key \
+         --tls-server-name localhost \
+         --host 127.0.0.1 --port 45900 \
+         --method Example.Echo --data "hello secure"
+```
+
+The CLI behaves exactly like `RpcClient`.

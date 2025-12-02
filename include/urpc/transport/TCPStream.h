@@ -25,6 +25,7 @@ namespace urpc
             uint8_t* data,
             size_t len) override;
 
+        [[nodiscard]] const RpcPeerIdentity* peer_identity() const noexcept override;
         void shutdown() override;
 
     private:

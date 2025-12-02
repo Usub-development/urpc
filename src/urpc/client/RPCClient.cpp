@@ -8,6 +8,7 @@
 
 #include <urpc/client/RPCClient.h>
 #include <urpc/utils/Endianness.h>
+#include <urpc/transport/TCPStreamFactory.h>
 
 namespace urpc
 {
@@ -32,11 +33,21 @@ namespace urpc
             "RpcClient::read_exact: async_read r={} size={}",
             r, buf.size());
 #endif
-        if (r <= 0)
+
+        if (r == 0)
+        {
+#if URPC_LOGS
+            usub::ulog::info(
+                "RpcClient::read_exact: EOF (r=0) -> stop reading");
+#endif
+            co_return false; // сигнал наверх "дальше читать нечего"
+        }
+
+        if (r < 0)
         {
 #if URPC_LOGS
             usub::ulog::warn(
-                "RpcClient::read_exact: r<=0 (r={}) -> fail", r);
+                "RpcClient::read_exact: async_read error r={}", r);
 #endif
             co_return false;
         }
@@ -45,13 +56,28 @@ namespace urpc
     }
 
     RpcClient::RpcClient(std::string host, uint16_t port)
-        : host_(std::move(host))
-          , port_(port)
+        : RpcClient(RpcClientConfig{
+            std::move(host),
+            port,
+            nullptr
+        })
+    {
+    }
+
+    RpcClient::RpcClient(RpcClientConfig cfg)
+        : config_(std::move(cfg))
     {
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcClient ctor host={} port={}", this->host_, this->port_);
+            "RpcClient ctor host={} port={}",
+            this->config_.host,
+            this->config_.port);
 #endif
+        if (!this->config_.stream_factory)
+        {
+            this->config_.stream_factory =
+                std::make_shared<TcpRpcStreamFactory>();
+        }
     }
 
     usub::uvent::task::Awaitable<std::vector<uint8_t>> RpcClient::async_call(
@@ -295,7 +321,7 @@ namespace urpc
     void RpcClient::close()
     {
 #if URPC_LOGS
-        usub::ulog::warn("RpcClient::close()");
+        usub::ulog::info("RpcClient::close()");
 #endif
         this->running_.store(false, std::memory_order_relaxed);
 
@@ -338,24 +364,29 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::info(
             "RpcClient::ensure_connected: connecting to {}:{}",
-            this->host_, this->port_);
+            this->config_.host, this->config_.port);
 #endif
 
-        net::TCPClientSocket sock;
-        auto res = co_await sock.async_connect(
-            this->host_.c_str(),
-            std::to_string(this->port_).c_str());
-        if (res.has_value())
+        if (!this->config_.stream_factory)
+        {
+            this->config_.stream_factory =
+                std::make_shared<TcpRpcStreamFactory>();
+        }
+
+        auto stream =
+            co_await this->config_.stream_factory->create_client_stream(
+                this->config_.host,
+                this->config_.port);
+        if (!stream)
         {
 #if URPC_LOGS
             usub::ulog::error(
-                "RpcClient::ensure_connected: async_connect failed, ec={}",
-                res.value());
+                "RpcClient::ensure_connected: stream_factory returned nullptr");
 #endif
             co_return false;
         }
 
-        this->stream_ = std::make_shared<TcpRpcStream>(std::move(sock));
+        this->stream_ = std::move(stream);
         this->running_.store(true, std::memory_order_relaxed);
 
 #if URPC_LOGS
@@ -718,7 +749,7 @@ namespace urpc
         {
             auto guard = co_await this->pending_mutex_.lock();
             (void)guard;
-            for (auto& [sid, call] : this->pending_calls_)
+            for (auto& call : this->pending_calls_ | std::views::values)
             {
                 if (call && call->event)
                 {
@@ -734,7 +765,7 @@ namespace urpc
         {
             auto guard = co_await this->ping_mutex_.lock();
             (void)guard;
-            for (auto& [sid, evt] : this->ping_waiters_)
+            for (auto& evt : this->ping_waiters_ | std::views::values)
             {
                 if (evt)
                     evt->set();
