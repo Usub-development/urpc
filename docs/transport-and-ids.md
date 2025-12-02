@@ -190,9 +190,9 @@ inline task::Awaitable<bool> send_frame(
 
 ### `send_frame`
 
-1. Serializes header into local 32-byte array.
-2. Calls `write_all` on header.
-3. Calls `write_all` on payload (if any).
+1. Serializes the header into a local **28-byte** array.
+2. Calls `write_all` on the header.
+3. Calls `write_all` on the payload (if any).
 
 Used by:
 

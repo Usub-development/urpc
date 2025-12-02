@@ -6,9 +6,11 @@ It uses a compact big-endian header and fully supports multiplexing: many concur
 Every message on the wire is a **Frame**:
 
 ```
+
 +-------------------+-----------------------------+
 | Header (fixed)    | Payload (binary, length N) |
 +-------------------+-----------------------------+
+
 ```
 
 ---
@@ -31,9 +33,9 @@ uint64  method_id   // FNV1a64("Service.Method") for requests; echoed in respons
 uint32  length      // payload size in bytes
 ```
 
-The `reserved` field is included in the header (total size = 32 bytes),
-but is not used by the current protocol version. Implementations MUST
-send it as zero and MUST ignore its value when receiving.
+The `reserved` field is included in the header but is not used by the current
+protocol version. Implementations MUST send it as zero and MUST ignore its value
+when receiving.
 
 ---
 
@@ -126,9 +128,9 @@ Produces a `Response` frame:
 
 On `ERROR`:
 
-* The client marks the pending call as failed.
-* The response vector is returned **empty**.
-* If desired, the user can decode the error payload manually.
+* The client marks the pending call as failed and decodes `code` / `message` internally.
+* The response vector returned by the high-level C++ client is **empty**.
+* Other implementations may choose to expose `code`, `message`, and `details` directly.
 
 ---
 
@@ -218,11 +220,14 @@ Everything above remains identical.
 ## Example mTLS certificate generation
 
 1. Create certs folder:
+
 ```bash
 mkdir certs
 cd certs 
 ```
+
 2. CA:
+
 ```bash
 # CA key
 openssl genrsa -out ca.key 4096
@@ -234,7 +239,9 @@ openssl req -x509 -new -nodes \
   -out ca.crt \
   -subj "/C=XX/ST=TestState/L=TestCity/O=urpc-CA/OU=Dev/CN=urpc-test-ca"
 ```
+
 3. Server certificate:
+
 ```bash
 # Server key
 openssl genrsa -out server.key 2048
@@ -251,7 +258,9 @@ openssl x509 -req \
   -out server.crt \
   -days 365 -sha256
 ```
+
 4. Client certificate:
+
 ```bash
 # Client key
 openssl genrsa -out client.key 2048

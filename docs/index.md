@@ -11,7 +11,7 @@ backends:
 
 The protocol is designed for:
 
-* Low overhead (fixed 32-byte header, big-endian encoding)
+* Low overhead (**fixed 28-byte header**, big-endian encoding)
 * Full multiplexing over a single connection
 * Efficient coroutine-based processing (via **uvent**)
 * Extensibility through frame types, flags, and open versioning
@@ -52,7 +52,7 @@ A single protocol message:
 
 ```
 
-Always starts with a 32-byte header, followed by an optional payload.
+Always starts with a **28-byte header**, followed by an optional payload.
 
 ### **Method**
 
@@ -186,5 +186,3 @@ urpc_cli --tls \
 * [transport-and-ids.md](transport-and-ids.md) — Method IDs, connection rules
 * [client.md](client.md) — Reader loop, stream allocation, ping/pong
 * [server.md](server.md) — Accept loop, handler invocation, shutdown
-
-```

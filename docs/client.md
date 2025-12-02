@@ -130,7 +130,7 @@ client->async_call_ct<method_id("Service.Method")>(body);
 1. Captures `stream_`.
    If null → exit.
 
-2. Reads header via `read_exact`.
+2. Reads header (**28 bytes**) via `read_exact`.
    EOF or error → exit.
 
 3. Parses header.

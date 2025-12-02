@@ -4,6 +4,7 @@ This section describes how the server side of uRPC operates:
 `RpcServer`, `RpcConnection`, and `RpcMethodRegistry`.
 
 It covers:
+
 - TCP / TLS / mTLS server transports
 - Accept loop
 - Per-connection RPC handling
@@ -221,7 +222,7 @@ On return:
 1. Validate `stream_`
 2. Loop forever:
 
-    * Read header (32 bytes)
+    * Read header (**28 bytes**)
     * Parse header
     * Validate magic/version
     * Read payload (if any)

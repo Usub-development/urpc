@@ -1,6 +1,6 @@
 # Wire Format
 
-uRPC uses a fixed **32-byte** binary header followed by an optional payload.
+uRPC uses a fixed **28-byte** binary header followed by an optional payload.
 All integers are **big-endian**.
 
 The framing format is identical for TCP, TLS, and mTLS transports.
@@ -25,27 +25,25 @@ Applied to:
 
 ---
 
-# Frame header (32 bytes)
+# Frame header (28 bytes)
 
-The wire header is always **exactly 32 bytes**:
+The wire header is always **exactly 28 bytes**:
 
-| Field     | Type   | Size | Endianness | Description                                |
-|-----------|--------|------|------------|--------------------------------------------|
-| magic     | uint32 | 4    | BE         | `'URPC'` = `0x55525043`                    |
-| version   | uint8  | 1    | —          | Protocol version (`1`)                     |
-| type      | uint8  | 1    | —          | FrameType (Request/Response/Ping/...)      |
-| flags     | uint16 | 2    | BE         | FrameFlags bitmask                         |
-| reserved  | uint32 | 4    | BE         | Must be `0`; reserved for future extension |
-| stream_id | uint32 | 4    | BE         | Logical RPC stream ID                      |
-| method_id | uint64 | 8    | BE         | Numeric method ID (64-bit hash)            |
-| length    | uint32 | 4    | BE         | Payload length in bytes                    |
+| Field     | Type   | Size | Endianness | Description                         |
+|-----------|--------|------|------------|-------------------------------------|
+| magic     | uint32 | 4    | BE         | `'URPC'` = `0x55525043`             |
+| version   | uint8  | 1    | —          | Protocol version (`1`)              |
+| type      | uint8  | 1    | —          | FrameType (Request/Response/Ping/…) |
+| flags     | uint16 | 2    | BE         | FrameFlags bitmask                  |
+| stream_id | uint32 | 4    | BE         | Logical RPC stream ID               |
+| method_id | uint64 | 8    | BE         | Numeric method ID (64-bit hash)     |
+| length    | uint32 | 4    | BE         | Payload length in bytes             |
 
-Total: **32 bytes**
+Total: **28 bytes**
 
 ### Notes
 
-* `reserved` is **present on the wire** and must be written as zero.
-* The C++ struct `RpcFrameHeader` also has size 32, so serialization/deserialization maps 1:1 to the actual wire format.
+* The on-wire layout is fully packed (no padding).
 * Any frame with invalid magic/version causes the connection to close immediately.
 
 ---
@@ -107,16 +105,16 @@ enum FrameFlags : uint8_t
 
 # Payload
 
-Payload immediately follows the 32-byte header.
+Payload immediately follows the **28-byte** header.
 
 ```
 +-------------------+-----------------------------+
-| 32-byte header    | payload[ length ]           |
+| 28-byte header    | payload[ length ]           |
 +-------------------+-----------------------------+
 ```
 
 * If `length == 0`, no payload is present.
-* Payload is **opaque**; protocol does not impose a serialization format.
+* Payload is **opaque**; the protocol does not impose a serialization format.
 
 ### Payload by type
 
@@ -153,19 +151,10 @@ Constraints:
 * `payload.size() >= 8`
 * `payload.size() >= 8 + msg_len`
 
-### Construction
+Construction:
 
-Server builds this in:
-
-```
-RpcConnection::send_simple_error()
-```
-
-Client parses this in:
-
-```
-RpcClient::parse_error_payload()
-```
+* Server builds this in `RpcConnection::send_simple_error()`
+* Client parses this in `RpcClient::parse_error_payload()`
 
 If error is detected:
 
@@ -204,11 +193,11 @@ payload   = empty
 
 # Stream IDs
 
-* 32-bit unsigned integer.
-* `0` is reserved.
-* Client assigns stream IDs sequentially using atomic counter.
-* Response always uses the same `stream_id` as its Request.
-* When `END_STREAM` is set, the logical stream is closed.
+* 32-bit unsigned integer
+* `0` is reserved
+* Client assigns stream IDs sequentially
+* Response always uses the same `stream_id`
+* When `END_STREAM` is set, the logical stream is closed
 
 ---
 
@@ -227,24 +216,10 @@ Two ways to produce them:
 uint64_t id = fnv1a64_rt("Example.Echo");
 ```
 
-Used by:
-
-```
-client->async_call("Example.Echo", ...)
-server.register_method("Example.Echo", ...)
-```
-
 ### Compile-time
 
 ```cpp
 constexpr uint64_t EchoId = method_id("Example.Echo");
-```
-
-Used by:
-
-```
-client->async_call_ct<EchoId>(...)
-server.register_method_ct<EchoId>(...)
 ```
 
 Compile-time IDs guarantee an identical constant across client/server.
@@ -253,7 +228,7 @@ Compile-time IDs guarantee an identical constant across client/server.
 
 # Summary
 
-* uRPC’s wire format is a simple **32-byte header** + binary payload.
+* uRPC’s wire format is a simple **28-byte header** + binary payload.
 * All multibyte integers are **big-endian**.
 * Transport layer (TCP/TLS/mTLS) does not change framing.
 * Error semantics are fully binary.
