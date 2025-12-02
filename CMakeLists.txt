@@ -11,7 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 
-option(URPC_LOGS "Use URPC_LOGS" ON)
+option(URPC_LOGS "Use URPC_LOGS" OFF)
 option(URPC_BUILD_CLI "Build urpc_cli command-line tool" ON)
 
 message(STATUS "URPC_LOGS = ${URPC_LOGS}")

@@ -48,12 +48,13 @@ markdown_extensions:
       permalink: true
 
 nav:
-  - Overview: urpc/index.md
+  - Overview: index.md
+  - Building: building.md
   - Protocol:
-      - Wire Format: urpc/wire-format.md
-      - Client: urpc/client.md
-      - Server: urpc/server.md
-      - Transport & Method IDs: urpc/transport-and-ids.md
+      - Wire Format: wire-format.md
+      - Client: client.md
+      - Server: server.md
+      - Transport & Method IDs: transport-and-ids.md
 
 extra:
   social:
