@@ -1,4 +1,3 @@
-// TCPStream.cpp
 #include <urpc/transport/TCPStream.h>
 
 namespace urpc

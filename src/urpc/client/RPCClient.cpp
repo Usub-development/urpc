@@ -1,4 +1,3 @@
-// RpcClient.cpp
 //
 // Created by Kirill Zhukov on 29.11.2025.
 //
@@ -1055,7 +1054,6 @@ namespace urpc
 
                     if (is_error)
                     {
-                        // error-payload всегда парсим уже после decrypt (если был)
                         usub::uvent::utils::DynamicBuffer tmp;
                         if (!payload_view.empty())
                         {
