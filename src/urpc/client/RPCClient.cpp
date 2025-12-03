@@ -1,18 +1,276 @@
+// RpcClient.cpp
 //
 // Created by Kirill Zhukov on 29.11.2025.
 //
 
 #include <cstring>
+#include <array>
+
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #include <uvent/utils/buffer/DynamicBuffer.h>
 
 #include <urpc/client/RPCClient.h>
 #include <urpc/utils/Endianness.h>
 #include <urpc/transport/TCPStreamFactory.h>
+#include <urpc/crypto/AppCrypto.h>
+#include <urpc/transport/TlsRpcStream.h>
 
 namespace urpc
 {
     using namespace usub::uvent;
+
+    static const AppCipherContext* get_cipher_for_stream(
+        const std::shared_ptr<IRpcStream>& s)
+    {
+        auto tls = std::dynamic_pointer_cast<TlsRpcStream>(s);
+        if (!tls)
+            return nullptr;
+        return tls->app_cipher();
+    }
+
+    static uint16_t build_security_flags_client(const std::shared_ptr<IRpcStream>& stream)
+    {
+        const RpcPeerIdentity* peer = nullptr;
+        if (stream)
+            peer = stream->peer_identity();
+
+        uint16_t flags = 0;
+        if (peer)
+        {
+            flags |= FLAG_TLS;
+            if (peer->authenticated)
+                flags |= FLAG_MTLS;
+        }
+        return flags;
+    }
+
+    static bool aes256_gcm_encrypt_client(
+        const uint8_t* key,
+        const uint8_t* iv,
+        size_t iv_len,
+        const uint8_t* in,
+        size_t in_len,
+        uint8_t* out,
+        uint8_t* tag)
+    {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx)
+            return false;
+
+        int len = 0;
+        int out_len = 0;
+        bool ok = true;
+
+        ok = ok && (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
+        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
+        ok = ok && (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
+
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        if (in_len > 0)
+        {
+            ok = ok && (EVP_EncryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
+            out_len = len;
+        }
+
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        ok = ok && (EVP_EncryptFinal_ex(ctx, out + out_len, &len) == 1);
+        out_len += len;
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1);
+        EVP_CIPHER_CTX_free(ctx);
+
+        if (!ok)
+            return false;
+        if (out_len != static_cast<int>(in_len))
+            return false;
+
+        return true;
+    }
+
+    static bool aes256_gcm_decrypt_client(
+        const uint8_t* key,
+        const uint8_t* iv,
+        size_t iv_len,
+        const uint8_t* in,
+        size_t in_len,
+        const uint8_t* tag,
+        uint8_t* out)
+    {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx)
+            return false;
+
+        int len = 0;
+        int out_len = 0;
+        bool ok = true;
+
+        ok = ok && (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
+        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
+        ok = ok && (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
+
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        if (in_len > 0)
+        {
+            ok = ok && (EVP_DecryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
+            out_len = len;
+        }
+
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) == 1);
+        if (!ok)
+        {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+
+        int final_rc = EVP_DecryptFinal_ex(ctx, out + out_len, &len);
+        EVP_CIPHER_CTX_free(ctx);
+
+        if (final_rc <= 0)
+            return false;
+
+        out_len += len;
+        if (out_len != static_cast<int>(in_len))
+            return false;
+
+        return true;
+    }
+
+    static std::vector<uint8_t> encrypt_body_only_client(
+        const std::shared_ptr<IRpcStream>& stream,
+        uint16_t& flags,
+        std::span<const uint8_t> body)
+    {
+        if (body.empty())
+            return {};
+
+        if (!stream)
+        {
+            std::vector<uint8_t> out;
+            out.reserve(body.size());
+            out.insert(out.end(), body.begin(), body.end());
+            return out;
+        }
+
+        std::array<uint8_t, 32> key{};
+        if (!stream->get_app_secret_key(key))
+        {
+            std::vector<uint8_t> out;
+            out.reserve(body.size());
+            out.insert(out.end(), body.begin(), body.end());
+            return out;
+        }
+
+        std::vector<uint8_t> out;
+        const std::size_t iv_len = 12;
+        const std::size_t tag_len = 16;
+        out.resize(iv_len + tag_len + body.size());
+
+        uint8_t* iv = out.data();
+        uint8_t* tag = out.data() + iv_len;
+        uint8_t* ct = out.data() + iv_len + tag_len;
+
+        if (RAND_bytes(iv, static_cast<int>(iv_len)) != 1)
+        {
+            out.clear();
+            return out;
+        }
+
+        if (!aes256_gcm_encrypt_client(
+            key.data(),
+            iv,
+            iv_len,
+            body.data(),
+            body.size(),
+            ct,
+            tag))
+        {
+            out.clear();
+            return out;
+        }
+
+        flags |= FLAG_ENCRYPTED;
+        return out;
+    }
+
+    static std::span<const uint8_t> decrypt_body_if_needed_client(
+        IRpcStream& stream,
+        uint16_t flags,
+        const usub::uvent::utils::DynamicBuffer& payload,
+        std::vector<uint8_t>& tmp)
+    {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(payload.data());
+        std::size_t sz = payload.size();
+
+        if ((flags & FLAG_ENCRYPTED) == 0)
+        {
+            return {data, sz};
+        }
+
+        if (sz < 12 + 16)
+        {
+            tmp.clear();
+            return {tmp.data(), 0};
+        }
+
+        std::array<uint8_t, 32> key{};
+        if (!stream.get_app_secret_key(key))
+        {
+            tmp.clear();
+            return {tmp.data(), 0};
+        }
+
+        const std::size_t iv_len = 12;
+        const std::size_t tag_len = 16;
+        const uint8_t* iv = data;
+        const uint8_t* tag = data + iv_len;
+        const uint8_t* ct = data + iv_len + tag_len;
+        std::size_t ct_len = sz - iv_len - tag_len;
+
+        tmp.resize(ct_len);
+
+        if (!aes256_gcm_decrypt_client(
+            key.data(),
+            iv,
+            iv_len,
+            ct,
+            ct_len,
+            tag,
+            tmp.data()))
+        {
+            tmp.clear();
+            return {tmp.data(), 0};
+        }
+
+        return {tmp.data(), tmp.size()};
+    }
 
     static task::Awaitable<bool> read_exact(
         IRpcStream& stream,
@@ -40,7 +298,7 @@ namespace urpc
             usub::ulog::info(
                 "RpcClient::read_exact: EOF (r=0) -> stop reading");
 #endif
-            co_return false; // сигнал наверх "дальше читать нечего"
+            co_return false;
         }
 
         if (r < 0)
@@ -76,11 +334,12 @@ namespace urpc
         if (!this->config_.stream_factory)
         {
             this->config_.stream_factory =
-                std::make_shared<TcpRpcStreamFactory>();
+                std::make_shared<TcpRpcStreamFactory>(this->config_.socket_timeout_ms);
         }
     }
 
-    usub::uvent::task::Awaitable<std::vector<uint8_t>> RpcClient::async_call(
+    usub::uvent::task::Awaitable<std::vector<uint8_t>>
+    RpcClient::async_call(
         uint64_t method_id,
         std::span<const uint8_t> request_body)
     {
@@ -131,6 +390,9 @@ namespace urpc
         hdr.stream_id = sid;
         hdr.method_id = method_id;
         hdr.length = static_cast<uint32_t>(request_body.size());
+
+        std::vector<uint8_t> enc_buf;
+
         {
             auto guard = co_await this->write_mutex_.lock();
             (void)guard;
@@ -149,12 +411,52 @@ namespace urpc
                 co_return empty;
             }
 
+            const AppCipherContext* cipher =
+                get_cipher_for_stream(stream);
+
+            std::span<const uint8_t> to_send = request_body;
+
+            if (cipher && !request_body.empty())
+            {
+                bool enc_ok = app_encrypt_gcm(
+                    *cipher,
+                    request_body,
+                    enc_buf);
+                if (enc_ok)
+                {
+                    hdr.flags |= FLAG_ENCRYPTED;
+                    hdr.length =
+                        static_cast<uint32_t>(enc_buf.size());
+                    to_send = std::span<const uint8_t>{
+                        enc_buf.data(),
+                        enc_buf.size()
+                    };
+#if URPC_LOGS
+                    usub::ulog::debug(
+                        "RpcClient::async_call: encrypted body sid={} "
+                        "plain_len={} enc_len={}",
+                        sid,
+                        request_body.size(),
+                        enc_buf.size());
+#endif
+                }
+                else
+                {
+#if URPC_LOGS
+                    usub::ulog::warn(
+                        "RpcClient::async_call: app_encrypt_gcm failed, "
+                        "sending plaintext sid={}",
+                        sid);
+#endif
+                }
+            }
+
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcClient::async_call: BEFORE send_frame sid={} len={}",
-                sid, hdr.length);
+                "RpcClient::async_call: BEFORE send_frame sid={} len={} flags=0x{:x}",
+                sid, hdr.length, hdr.flags);
 #endif
-            bool sent = co_await send_frame(*stream, hdr, request_body);
+            bool sent = co_await send_frame(*stream, hdr, to_send);
             if (!sent)
             {
 #if URPC_LOGS
@@ -244,7 +546,11 @@ namespace urpc
         hdr.magic = 0x55525043;
         hdr.version = 1;
         hdr.type = static_cast<uint8_t>(FrameType::Ping);
-        hdr.flags = FLAG_END_STREAM;
+
+        uint16_t flags = FLAG_END_STREAM |
+            build_security_flags_client(this->stream_);
+
+        hdr.flags = flags;
         hdr.stream_id = sid;
         hdr.method_id = 0;
         hdr.length = 0;
@@ -269,7 +575,8 @@ namespace urpc
 
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcClient::async_ping: BEFORE send_frame sid={}", sid);
+                "RpcClient::async_ping: BEFORE send_frame sid={} flags=0x{:x}",
+                sid, hdr.flags);
 #endif
             const bool sent =
                 co_await send_frame(*stream, hdr, {});
@@ -398,7 +705,72 @@ namespace urpc
         usub::uvent::system::co_spawn(
             RpcClient::run_reader_detached(std::move(self)));
 
+        if (this->config_.ping_interval_ms > 0)
+        {
+            auto self2 = this->shared_from_this();
+            usub::uvent::system::co_spawn(
+                RpcClient::run_ping_detached(std::move(self2)));
+        }
+
         co_return true;
+    }
+
+    usub::uvent::task::Awaitable<void>
+    RpcClient::run_ping_detached(std::shared_ptr<RpcClient> self)
+    {
+#if URPC_LOGS
+        usub::ulog::info("RpcClient::ping_loop wrapper: start");
+#endif
+        co_await self->ping_loop();
+#if URPC_LOGS
+        usub::ulog::info("RpcClient::ping_loop wrapper: end");
+#endif
+        co_return;
+    }
+
+    usub::uvent::task::Awaitable<void> RpcClient::ping_loop()
+    {
+        using namespace usub::uvent;
+        using namespace std::chrono_literals;
+
+        const auto interval_ms = this->config_.ping_interval_ms;
+        if (interval_ms == 0)
+            co_return;
+
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcClient::ping_loop: started, interval={}ms",
+            interval_ms);
+#endif
+
+        const auto interval = std::chrono::milliseconds(interval_ms);
+
+        while (this->running_.load(std::memory_order_relaxed))
+        {
+            co_await system::this_coroutine::sleep_for(interval);
+
+            if (!this->running_.load(std::memory_order_relaxed))
+                break;
+
+#if URPC_LOGS
+            usub::ulog::debug("RpcClient::ping_loop: sending async_ping");
+#endif
+            const bool ok = co_await this->async_ping();
+            if (!ok)
+            {
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcClient::ping_loop: async_ping failed, closing connection");
+#endif
+                this->close();
+                break;
+            }
+        }
+
+#if URPC_LOGS
+        usub::ulog::info("RpcClient::ping_loop: exit");
+#endif
+        co_return;
     }
 
     bool RpcClient::parse_error_payload(
@@ -519,12 +891,13 @@ namespace urpc
 #if URPC_LOGS
             usub::ulog::debug(
                 "RpcClient::reader_loop: parsed header magic={} ver={} "
-                "type={} sid={} len={}",
+                "type={} sid={} len={} flags=0x{:x}",
                 static_cast<unsigned>(hdr.magic),
                 static_cast<unsigned>(hdr.version),
                 static_cast<unsigned>(hdr.type),
                 hdr.stream_id,
-                hdr.length);
+                hdr.length,
+                hdr.flags);
 #endif
             if (hdr.magic != 0x55525043 || hdr.version != 1)
             {
@@ -585,7 +958,7 @@ namespace urpc
                 {
 #if URPC_LOGS
                     usub::ulog::debug(
-                        "RpcClient::reader_loop: handling Response sid={} len={} flags={}",
+                        "RpcClient::reader_loop: handling Response sid={} len={} flags=0x{:x}",
                         frame.header.stream_id,
                         frame.header.length,
                         frame.header.flags);
@@ -613,13 +986,86 @@ namespace urpc
 
                     const bool is_error =
                         (frame.header.flags & FLAG_ERROR) != 0;
+                    const bool encrypted =
+                        (frame.header.flags & FLAG_ENCRYPTED) != 0;
+
+                    std::span<const uint8_t> payload_view{
+                        reinterpret_cast<const uint8_t*>(frame.payload.data()),
+                        frame.payload.size()
+                    };
+
+                    std::vector<uint8_t> decrypted;
+
+                    if (encrypted)
+                    {
+                        const AppCipherContext* cipher =
+                            get_cipher_for_stream(this->stream_);
+                        if (!cipher)
+                        {
+#if URPC_LOGS
+                            usub::ulog::warn(
+                                "RpcClient::reader_loop: encrypted Response "
+                                "but no cipher sid={}",
+                                frame.header.stream_id);
+#endif
+                            call->error = true;
+                            call->error_code = 0;
+                            call->error_message =
+                                "Encrypted response but cipher not available";
+                            if (call->event)
+                                call->event->set();
+                            break;
+                        }
+
+                        bool ok_dec = app_decrypt_gcm(
+                            *cipher,
+                            payload_view,
+                            decrypted);
+                        if (!ok_dec)
+                        {
+#if URPC_LOGS
+                            usub::ulog::warn(
+                                "RpcClient::reader_loop: app_decrypt_gcm failed "
+                                "sid={}",
+                                frame.header.stream_id);
+#endif
+                            call->error = true;
+                            call->error_code = 0;
+                            call->error_message =
+                                "Failed to decrypt response";
+                            if (call->event)
+                                call->event->set();
+                            break;
+                        }
+
+                        payload_view = std::span<const uint8_t>{
+                            decrypted.data(),
+                            decrypted.size()
+                        };
+
+#if URPC_LOGS
+                        usub::ulog::debug(
+                            "RpcClient::reader_loop: decrypted Response sid={} "
+                            "enc_len={} plain_len={}",
+                            frame.header.stream_id,
+                            frame.payload.size(),
+                            decrypted.size());
+#endif
+                    }
 
                     if (is_error)
                     {
+                        // error-payload всегда парсим уже после decrypt (если был)
+                        usub::uvent::utils::DynamicBuffer tmp;
+                        if (!payload_view.empty())
+                        {
+                            tmp.append(payload_view.data(),
+                                       payload_view.size());
+                        }
+
                         uint32_t code = 0;
                         std::string msg;
-                        if (this->parse_error_payload(
-                            frame.payload, code, msg))
+                        if (this->parse_error_payload(tmp, code, msg))
                         {
                             call->error = true;
                             call->error_code = code;
@@ -637,7 +1083,8 @@ namespace urpc
                         {
                             call->error = true;
                             call->error_code = 0;
-                            call->error_message = "Malformed error payload";
+                            call->error_message =
+                                "Malformed error payload";
 #if URPC_LOGS
                             usub::ulog::warn(
                                 "RpcClient::reader_loop: malformed error "
@@ -651,12 +1098,12 @@ namespace urpc
                     }
                     else
                     {
-                        auto sz = frame.payload.size();
+                        auto sz = payload_view.size();
                         call->response.resize(sz);
                         if (sz > 0)
                         {
                             std::memcpy(call->response.data(),
-                                        frame.payload.data(),
+                                        payload_view.data(),
                                         sz);
                         }
                         call->error = false;
@@ -666,7 +1113,6 @@ namespace urpc
 
                     break;
                 }
-
             case FrameType::Ping:
                 {
 #if URPC_LOGS
@@ -678,7 +1124,8 @@ namespace urpc
                     resp.magic = 0x55525043;
                     resp.version = 1;
                     resp.type = static_cast<uint8_t>(FrameType::Pong);
-                    resp.flags = FLAG_END_STREAM;
+                    resp.flags = FLAG_END_STREAM |
+                        build_security_flags_client(this->stream_);
                     resp.stream_id = frame.header.stream_id;
                     resp.method_id = frame.header.method_id;
                     resp.length = 0;
@@ -698,8 +1145,9 @@ namespace urpc
 
 #if URPC_LOGS
                     usub::ulog::debug(
-                        "RpcClient::reader_loop: sending Pong sid={}",
-                        resp.stream_id);
+                        "RpcClient::reader_loop: sending Pong sid={} flags=0x{:x}",
+                        resp.stream_id,
+                        resp.flags);
 #endif
                     co_await send_frame(*stream2, resp, {});
                     break;

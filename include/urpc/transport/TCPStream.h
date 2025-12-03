@@ -26,6 +26,14 @@ namespace urpc
             size_t len) override;
 
         [[nodiscard]] const RpcPeerIdentity* peer_identity() const noexcept override;
+
+        [[nodiscard]] bool get_app_secret_key(
+            std::array<uint8_t, 32>& out_key) const noexcept override
+        {
+            (void)out_key;
+            return false;
+        }
+
         void shutdown() override;
 
     private:

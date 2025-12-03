@@ -78,6 +78,10 @@ namespace urpc
 
         usub::uvent::task::Awaitable<bool> async_ping();
 
+        static usub::uvent::task::Awaitable<void> run_ping_detached(
+            std::shared_ptr<RpcClient> self);
+        usub::uvent::task::Awaitable<void> ping_loop();
+
         void close();
 
     private:

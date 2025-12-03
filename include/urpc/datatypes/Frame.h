@@ -31,6 +31,10 @@ namespace urpc
         FLAG_END_STREAM = 0x01,
         FLAG_ERROR = 0x02,
         FLAG_COMPRESSED = 0x04,
+
+        FLAG_TLS = 0x08, // transport is TLS
+        FLAG_MTLS = 0x10, // mutual TLS (client cert)
+        FLAG_ENCRYPTED = 0x20, // body is app-encrypted
     };
 
     struct RpcFrameHeader

@@ -15,15 +15,31 @@ The protocol is designed for:
 * Full multiplexing over a single connection
 * Efficient coroutine-based processing (via **uvent**)
 * Extensibility through frame types, flags, and open versioning
+* Optional per-connection **AES-256-GCM payload encryption** on top of TLS
 
-This documentation covers:
+---
 
-* Wire format
-* Frame types and semantics
-* Method identification
-* Client and server behaviour
-* Ping/pong and cancellation
-* TLS and mTLS usage
+# Important Encryption Note
+
+uRPC framing never encrypts the header.
+
+* The **28-byte header is always plaintext** at the protocol level.
+* **TLS/mTLS** encrypt the underlying TCP stream, but the header is still parsed
+  in its normal plaintext form by uRPC.
+* **App-level AES (FLAG_ENCRYPTED)** encrypts **only the payload**, never the header.
+* AES keys are derived from the TLS exporter when app-level encryption is enabled.
+
+Payload flow:
+
+```
+
+plaintext body
+↓ (AES-256-GCM if enabled)
+IV[12] + ciphertext[...] + TAG[16]
+
+```
+
+Header is unaffected.
 
 ---
 
@@ -35,10 +51,9 @@ A long-lived bidirectional byte stream (TCP, TLS, mTLS, or user-defined).
 
 ### **Stream**
 
-A logical RPC exchange within a connection, identified by a `stream_id`:
+A logical RPC exchange within a connection, identified by a non-zero `stream_id`.
 
-- `stream_id != 0`
-- Multiple concurrent RPCs are multiplexed on the same underlying transport.
+Multiple concurrent RPCs are multiplexed over a single transport instance.
 
 ### **Frame**
 
@@ -52,7 +67,8 @@ A single protocol message:
 
 ```
 
-Always starts with a **28-byte header**, followed by an optional payload.
+Always starts with a **28-byte header**, followed by an optional payload  
+(raw or AES-encrypted depending on flags and transport).
 
 ### **Method**
 
@@ -73,52 +89,61 @@ The server uses this ID to look up the registered handler.
 1. Client creates a stream:
     - `TcpRpcStream` (plain TCP)
     - `TlsRpcStream` (TLS)
-    - `TlsRpcStream` + client cert (mTLS)
+    - TLS + client cert (mTLS)
     - Custom `IRpcStream`
 
    Transport selection is done through `RpcClientConfig.stream_factory`.
 
+   If TLS is used and app-level AES is enabled, an AES key is derived immediately
+   after the TLS handshake.
+
 2. Client sends a **Request** frame:
     - `type = Request`
     - Non-zero `stream_id`
-    - `method_id = fnv1a64(name)`
-    - Payload = binary request body
+    - `method_id`
+    - Payload = raw or AES-encrypted request body
 
-3. Server’s `RpcConnection` loop:
-    - Reads and parses the frame
-    - Finds handler in `RpcMethodRegistry`
-    - Invokes handler coroutine:
+3. Server `RpcConnection` loop:
+    - Reads header (always plaintext)
+    - Reads payload
+    - If `FLAG_ENCRYPTED` → decrypt AES payload
+    - Looks up handler in `RpcMethodRegistry`
+    - Invokes coroutine handler:
       ```cpp
       Awaitable<std::vector<uint8_t>>(RpcContext&, std::span<const uint8_t>)
       ```
 
-4. Handler returns binary response.
+4. Handler returns the response body.
 
 5. Server sends a **Response** frame:
     - Same `stream_id`
     - Same `method_id`
-    - Payload = response bytes
+    - Payload = raw or AES-encrypted response bytes
 
-6. Client’s `RpcClient` matches the response by `stream_id` and resumes the awaiting coroutine.
+6. Client’s `RpcClient`:
+    - Reads header
+    - Reads payload (decrypts if needed)
+    - Matches by `stream_id`
+    - Wakes the awaiting coroutine
 
 ---
 
 # Concurrency Model
 
-* A single TCP/TLS connection carries many parallel RPCs.
-* Client allocates stream IDs using an atomic counter.
-* All writes are serialized with an async mutex (`write_mutex_`) to preserve framing.
+* One TCP/TLS/mTLS connection can carry many RPCs concurrently.
+* Client allocates unique stream IDs atomically.
+* Writes are serialized using an async mutex to preserve framing.
 * Server creates one `RpcConnection` per accepted socket.
 * Each connection has its own read loop coroutine.
-* All handlers run concurrently.
+* All handlers execute concurrently.
 
-This design eliminates head-of-line blocking inside the protocol layer.
+This avoids protocol-level head-of-line blocking.
 
 ---
 
-# Transport Layer (TCP/TLS/mTLS)
+# Transport Layer (TCP/TLS/mTLS + AES)
 
-Transport is pluggable. The client/server receive a factory:
+Transport is fully pluggable. The client/server receive a factory:
 
 ```cpp
 std::shared_ptr<IRpcStreamFactory> stream_factory;
@@ -131,20 +156,25 @@ Built-in factories:
 | `TcpRpcStreamFactory` | TCP       |
 | `TlsRpcStreamFactory` | TLS/mTLS  |
 
-`TlsRpcStreamFactory` configures:
+`TlsRpcStreamFactory` supports:
 
-* CA verification
-* Server certificate verification (SNI)
-* Optional client certificate (mTLS)
-* TLS handshake done inside stream
+* TLS server authentication (CA, hostname)
+* mTLS (client certificate)
+* TLS handshake performed inside the stream
+* Optional **app-level AES**, derived from TLS exporter
 
-Server-side factory enables TLS or mTLS by providing certificates and CA.
+AES only applies to **payload**; header always remains plaintext.
 
 ---
 
 # CLI Tool
 
-The repository includes `urpc_cli`, a minimal command-line client using the same protocol.
+The repository includes `urpc_cli`, a minimal command-line client implementing:
+
+* TCP
+* TLS
+* mTLS
+* App-level AES when TLS is enabled
 
 Examples:
 
@@ -156,16 +186,17 @@ urpc_cli --host 127.0.0.1 --port 45900 \
          --data "hello"
 ```
 
-### TLS
+### TLS (server-auth only, AES optional)
 
 ```
 urpc_cli --tls --tls-ca ca.crt \
          --tls-server-name localhost \
          --host 127.0.0.1 --port 45900 \
-         --method Example.Echo --data "hello"
+         --method Example.Echo \
+         --data "hello"
 ```
 
-### mTLS
+### mTLS (client certificate + AES optional)
 
 ```
 urpc_cli --tls \
@@ -182,7 +213,7 @@ urpc_cli --tls \
 
 # Next Sections
 
-* [wire-format.md](wire-format.md) — Header layout, frame types, flags
+* [wire-format.md](wire-format.md) — Header layout, payload rules, flags
 * [transport-and-ids.md](transport-and-ids.md) — Method IDs, connection rules
-* [client.md](client.md) — Reader loop, stream allocation, ping/pong
-* [server.md](server.md) — Accept loop, handler invocation, shutdown
+* [client.md](client.md) — Stream allocation, AES decrypt, reader loop
+* [server.md](server.md) — Accept loop, AES decrypt, handler invocation, shutdown

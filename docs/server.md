@@ -11,6 +11,18 @@ It covers:
 - Method registry
 - Cancellation
 - Response/error handling
+- Behaviour when app-level AES is enabled
+
+---
+
+# **Important encryption note**
+
+The uRPC **28-byte header is never encrypted**.
+
+* TLS/mTLS encrypts the transport stream, but the header remains in plaintext at the uRPC framing layer.
+* App-level AES (FLAG_ENCRYPTED) **only encrypts the payload**, never the header.
+
+The server always receives the header unencrypted and can read all fields before decrypting payload (if needed).
 
 ---
 
@@ -42,23 +54,23 @@ Two entry points:
 
 ### `Awaitable<void> RpcServer::run_async()`
 
-Runs the asynchronous accept loop.
+Asynchronous accept loop.
 
 ### `void RpcServer::run()`
 
-* Creates a `usub::Uvent` instance with `threads_` worker threads.
-* Spawns `run_async()` via `system::co_spawn`.
-* Calls `uvent.run()` to start the event loop.
+* Creates `usub::Uvent` with N worker threads
+* Spawns `run_async()`
+* Calls `uvent.run()`
 
-This is the typical entry point for a standalone server.
+This is the standard standalone entry point.
 
 ---
 
 # **Accept loop**
 
-`RpcServer::accept_loop()` performs:
+`RpcServer::accept_loop()`:
 
-1. Creates the listening socket:
+1. Create listening socket:
 
    ```cpp
    net::TCPServerSocket acceptor(host_.c_str(), port_);
@@ -72,21 +84,21 @@ This is the typical entry point for a standalone server.
    }
    ```
 
-3. On failed accept:
+3. On failure:
 
-    * Log
-    * Sleep 50ms (`this_coroutine::sleep_for`)
-    * Continue
+    * log
+    * sleep 50ms
+    * continue
 
 4. On success:
 
-    * Convert accepted TCP socket → `IRpcStream` using `stream_factory`
+    * Wrap into transport stream:
 
       ```cpp
       auto stream = stream_factory->create_server_stream(std::move(soc.value()));
       ```
 
-      With TLS/mTLS factory this performs a **server-side TLS handshake**.
+      For TLS/mTLS this performs a **server-side TLS handshake**.
 
     * Create connection:
 
@@ -100,11 +112,11 @@ This is the typical entry point for a standalone server.
       system::co_spawn(RpcConnection::run_detached(conn));
       ```
 
-Each accepted connection gets its own:
+Each accepted connection gets:
 
-* `RpcConnection` instance
-* Independent coroutine for reading frames
-* Independent write serialization mutex
+* its own `RpcConnection`
+* its own coroutine for frame reading
+* its own write mutex
 
 ---
 
@@ -113,43 +125,36 @@ Each accepted connection gets its own:
 Maps:
 
 ```
-method_id → function pointer (RpcHandlerFn*)
+method_id → RpcHandlerFn*
 ```
 
-Handler type:
+Handler signature:
 
 ```cpp
-using RpcHandlerFn =
-    usub::uvent::task::Awaitable<std::vector<uint8_t>>(
-        RpcContext&, std::span<const uint8_t>);
+Awaitable<std::vector<uint8_t>>(
+    RpcContext&, std::span<const uint8_t>);
 ```
 
 API:
 
 ```cpp
-void register_method(uint64_t method_id, RpcHandlerPtr fn);
+void register_method(uint64_t id, RpcHandlerPtr fn);
 void register_method(std::string_view name, RpcHandlerPtr fn); // runtime hash
-RpcHandlerPtr find(uint64_t method_id) const;
+RpcHandlerPtr find(uint64_t id) const;
 ```
 
-Compile-time registration:
+Compile-time:
 
 ```cpp
 template<uint64_t MethodId, typename F>
 void register_method_ct(F&& f);
 ```
 
-Server forwards registry access:
-
-```cpp
-RpcMethodRegistry& registry();
-```
-
 ---
 
 # **RpcContext**
 
-Passed to all handlers:
+Passed to every handler:
 
 ```cpp
 struct RpcContext {
@@ -161,27 +166,29 @@ struct RpcContext {
 };
 ```
 
-Purpose:
+Contains:
 
-* Identify which stream the response must be sent on
-* Access transport for optional out-of-band writes
-* Propagate cooperative cancellation
+* stream metadata
+* transport flags (TLS, mTLS, ENCRYPTED)
+* cancellation token
 
 ---
 
 # **RpcConnection**
 
-A `RpcConnection` manages a single TCP/TLS/mTLS connection.
+One per TCP/TLS/mTLS connection.
 
 Responsibilities:
 
 * Read frames
-* Dispatch requests
-* Manage per-RPC cancellation
-* Send responses and errors
+* Parse header (always plaintext)
+* Decrypt payload if `FLAG_ENCRYPTED`
+* Dispatch handler
+* Handle cancellation
+* Send responses or errors
 * Handle Ping/Pong
 
-Key fields:
+Fields:
 
 ```cpp
 std::shared_ptr<IRpcStream> stream_;
@@ -196,13 +203,13 @@ std::unordered_map<uint32_t,
 
 ## **Lifecycle**
 
-Connection entrypoint:
+Entrypoint:
 
 ```cpp
 static Awaitable<void> run_detached(std::shared_ptr<RpcConnection> self);
 ```
 
-This awaits:
+Executes:
 
 ```cpp
 co_await self->loop();
@@ -210,8 +217,8 @@ co_await self->loop();
 
 On return:
 
-* The connection is done
-* Transport will be shut down by caller or by read loop
+* connection finishes
+* stream is closed
 
 ---
 
@@ -219,14 +226,14 @@ On return:
 
 `RpcConnection::loop()`:
 
-1. Validate `stream_`
-2. Loop forever:
+1. Validate stream
+2. Loop:
 
-    * Read header (**28 bytes**)
-    * Parse header
-    * Validate magic/version
-    * Read payload (if any)
-    * Dispatch by frame type
+    * read **28-byte plaintext header**
+    * parse & validate
+    * read payload
+    * if `FLAG_ENCRYPTED` → decrypt AES-GCM
+    * dispatch by frame type
 
 ---
 
@@ -238,107 +245,54 @@ Awaitable<void> handle_request(RpcFrame frame);
 
 Steps:
 
-1. Lookup handler:
-
-   ```cpp
-   auto fn = registry_.find(method_id);
-   ```
-
-2. If not found:
-
-    * Send error response with:
-
-      ```
-      code = 404
-      message = "Unknown method"
-      ```
-    * Return
-
-3. Create a `CancellationSource` for this RPC:
-
-   ```cpp
-   cancel_map_[stream_id] = src;
-   ```
-
-4. Build `RpcContext`:
-
-   ```cpp
-   ctx.stream       = *stream_;
-   ctx.stream_id    = header.stream_id;
-   ctx.method_id    = header.method_id;
-   ctx.flags        = header.flags;
-   ctx.cancel_token = src->token();
-   ```
-
-5. Invoke handler:
-
-   ```cpp
-   auto resp = co_await (*fn)(ctx, payload_span);
-   ```
-
-6. Remove cancellation source:
-
-   ```cpp
-   cancel_map_.erase(stream_id);
-   ```
-
-7. Send success:
-
-   ```cpp
-   send_response(ctx, resp);
-   ```
+1. Lookup handler
+2. If missing → send error 404
+3. Create `CancellationSource`
+4. Build `RpcContext`
+5. Call handler
+6. Remove cancel source
+7. Send success response
 
 ---
 
 # **Cancel Handling**
 
-Triggered by frame:
+A frame with:
 
 ```
-type = FrameType::Cancel
+type = Cancel
 ```
 
-`handle_cancel(frame)`:
+Causes:
 
-1. Lookup `CancellationSource` in `cancel_map_`
-2. If found:
+* lookup cancellation source
+* if found → request cancellation
 
-    * Remove it
-    * Call `src->request_cancel()`
-3. Otherwise:
-
-    * Log missing source
-
-Handlers must cooperatively observe `ctx.cancel_token`.
+Handlers must check `ctx.cancel_token`.
 
 ---
 
 # **Ping Handling**
 
-`handle_ping(frame)`:
-
-* Always sends a matching Pong:
+`handle_ping(frame)` always replies with Pong:
 
 ```
-type = Pong
-flags = END_STREAM
+type      = Pong
+flags     = END_STREAM (+ TLS/MTLS bits)
 stream_id = same
 method_id = same
-payload = empty
 ```
-
-Uses `locked_send` to serialize write.
 
 ---
 
-# **Pong / Unknown Types**
+# **Ignored types**
 
 Server ignores:
 
 * `Response`
-* `Stream`
+* `Stream` (reserved)
 * `Pong`
-* Unknown types
+* unknown
 
 Only logs them.
 
@@ -348,10 +302,12 @@ Only logs them.
 
 ### `locked_send(hdr, body)`
 
-* Acquires `write_mutex_`
-* Calls `send_frame(*stream_, hdr, body)`
+Serializes writes:
 
-Guarantees **atomicity** of each frame on the wire.
+```cpp
+AsyncMutex lock(write_mutex_);
+send_frame(*stream_, hdr, body);
+```
 
 ### `send_response(ctx, body)`
 
@@ -365,20 +321,19 @@ method_id = ctx.method_id
 length    = body.size()
 ```
 
-Then calls `locked_send`.
+Then dispatches with `locked_send`.
 
-### `send_simple_error(ctx, code, msg)`
+### `send_simple_error`
 
-Builds an error payload:
+Builds binary error structure:
 
 ```
-u32: code
-u32: msg_len
+u32 code
+u32 msg_len
 msg bytes
-(details unused)
 ```
 
-And sends with:
+Sent with:
 
 ```
 flags = END_STREAM | ERROR
@@ -388,42 +343,64 @@ flags = END_STREAM | ERROR
 
 # **TLS / mTLS on the server**
 
-Server TLS is enabled by providing a TLS stream factory:
+Server uses TLS if a TLS factory is supplied:
 
 ```cpp
 config.stream_factory =
     std::make_shared<TlsRpcStreamFactory>(TlsServerSettings{
-        .ca         = "ca.crt",        // optional (required for mTLS)
-        .cert       = "server.crt",
-        .key        = "server.key",
-        .require_client_cert = true,    // mTLS
+        .ca   = "ca.crt",
+        .cert = "server.crt",
+        .key  = "server.key",
+        .require_client_cert = true, // mTLS
     });
 ```
 
-The accept loop performs:
+Handshake occurs inside:
 
-* TCP accept
-* TLS handshake inside `create_server_stream`
-* If handshake fails → connection closed
-* On success → `RpcConnection` created
+```
+create_server_stream(...)
+```
 
-mTLS validation includes:
+If handshake fails → connection discarded.
 
-* Proper client certificate
-* CA chain validation
-* SAN/Hostname checks (optional for client certs)
-* Access to full peer certificate via `stream_->peer_certificate()`
+### Header visibility under TLS
 
-Everything below the abstract `IRpcStream` is transport-specific.
+Even with TLS/mTLS:
+
+* TLS encrypts the TCP stream
+* uRPC **still receives the header as plaintext** at framing level
+  (the bytes are decrypted by TLS *before* uRPC reads them)
+
+From uRPC perspective the header is always readable and unencrypted.
+
+---
+
+# **App-level AES on the server**
+
+If `FLAG_ENCRYPTED`:
+
+* server decrypts **only the payload**
+* header stays readable
+
+AES-256-GCM key is derived from TLS exporter:
+
+```cpp
+SSL_export_keying_material(... "urpc_app_key_v1" ...)
+```
+
+Used only if both server and client enable app-level encryption.
 
 ---
 
 # **Summary**
 
-* Server accepts TCP or TLS/mTLS connections.
-* Each connection gets its own `RpcConnection`.
-* All requests are fully multiplexed by `stream_id`.
-* Cancellation is cooperative via `CancellationToken`.
-* Ping/Pong is built in.
-* Transport is pluggable.
-* Memory and concurrency model strictly follows uvent coroutine scheduling.
+* Server handles TCP, TLS, and mTLS transports.
+* TLS/mTLS do **not** encrypt uRPC headers; only raw TCP bytes are TLS-protected.
+* App-level AES encrypts **only the payload**, never the header.
+* Each client connection has its own `RpcConnection`.
+* Requests are multiplexed by `stream_id`.
+* Cancellation is cooperative.
+* Ping/Pong built-in.
+* Method registry is hash-based.
+* Transport layer is pluggable.
+* Flow is fully coroutine-driven under uvent.

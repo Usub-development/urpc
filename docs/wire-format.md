@@ -5,6 +5,14 @@ All integers are **big-endian**.
 
 The framing format is identical for TCP, TLS, and mTLS transports.
 
+**Important:**  
+**Neither TLS nor app-level AES encrypt the uRPC header.  
+Only the payload is ever encrypted.**  
+The 28-byte header is always sent in plaintext.
+
+If TLS with *app-level AES* is enabled, the payload is additionally encrypted
+(AES-256-GCM), but **the wire framing does not change**.
+
 ---
 
 # Byte order
@@ -43,8 +51,9 @@ Total: **28 bytes**
 
 ### Notes
 
-* The on-wire layout is fully packed (no padding).
-* Any frame with invalid magic/version causes the connection to close immediately.
+* Header has no padding.
+* Header is never encrypted (not by TLS, not by AES).
+* Any invalid `magic` / `version` closes the connection.
 
 ---
 
@@ -64,12 +73,11 @@ enum class FrameType : uint8_t
 
 Meaning:
 
-* **Request** — client → server: start a new RPC
-* **Response** — server → client: final result (success or error)
-* **Stream** — reserved, unused
-* **Cancel** — client → server: cancel an in-flight RPC
-* **Ping** — health probe (either direction)
-* **Pong** — reply to Ping, mirrors stream_id/method_id
+* **Request** — client → server
+* **Response** — server → client
+* **Stream** — reserved
+* **Cancel** — cancel running RPC
+* **Ping/Pong** — liveness messages
 
 ---
 
@@ -81,31 +89,56 @@ enum FrameFlags : uint8_t
     FLAG_END_STREAM = 0x01,
     FLAG_ERROR      = 0x02,
     FLAG_COMPRESSED = 0x04,
+
+    FLAG_TLS        = 0x08, // transport is TLS
+    FLAG_MTLS       = 0x10, // mutual TLS (client cert)
+    FLAG_ENCRYPTED  = 0x20, // body is AES-GCM encrypted
 };
 ```
 
 ### Currently used:
 
-* **FLAG_END_STREAM**
+**FLAG_END_STREAM**
+*Set on all Request/Response/Ping/Pong.*
+Marks the end of a logical stream.
 
-    * Set on all Request, Response, Ping, Pong.
-    * Indicates no more frames for this stream.
+**FLAG_ERROR**
+Payload is an error payload.
 
-* **FLAG_ERROR**
+**FLAG_COMPRESSED**
+Reserved.
 
-    * Only meaningful on Response.
-    * Payload becomes a binary *error payload* (see below).
+**FLAG_TLS**
+Underlying connection uses TLS.
+Header still remains plaintext.
 
-* **FLAG_COMPRESSED**
+**FLAG_MTLS**
+TLS connection with verified client certificate.
+Header still remains plaintext.
 
-    * Reserved for future use.
-    * Must be ignored by receivers.
+**FLAG_ENCRYPTED**
+Payload is encrypted with **AES-256-GCM**.
+Header is not encrypted.
 
 ---
 
 # Payload
 
-Payload immediately follows the **28-byte** header.
+Payload immediately follows the fixed header.
+
+If `FLAG_ENCRYPTED`:
+
+```
+payload = IV[12] + ciphertext[...] + TAG[16]
+```
+
+Otherwise:
+
+```
+payload = raw binary
+```
+
+### Layout
 
 ```
 +-------------------+-----------------------------+
@@ -113,18 +146,60 @@ Payload immediately follows the **28-byte** header.
 +-------------------+-----------------------------+
 ```
 
-* If `length == 0`, no payload is present.
-* Payload is **opaque**; the protocol does not impose a serialization format.
+* `length == 0`: no payload
+* payload format = depends on type + flags
 
-### Payload by type
+**TLS note:**
+TLS encrypts the TCP stream but **does not encrypt or alter the uRPC header**.
 
-| Type      | Meaning                   |
-|-----------|---------------------------|
-| Request   | Binary request body       |
-| Response  | Success or error payload  |
-| Ping/Pong | No payload (`length = 0`) |
-| Cancel    | No payload (`length = 0`) |
-| Stream    | Reserved                  |
+---
+
+# Payload by type
+
+| Type      | Meaning                       |
+|-----------|-------------------------------|
+| Request   | Raw or AES-encrypted data     |
+| Response  | Raw/AES body or error payload |
+| Ping/Pong | Always empty                  |
+| Cancel    | Empty                         |
+| Stream    | Reserved                      |
+
+---
+
+# Encrypted payload (FLAG_ENCRYPTED)
+
+If:
+
+```
+flags has FLAG_ENCRYPTED
+```
+
+the payload has 3 components:
+
+| Component | Size     | Description            |
+|----------:|----------|------------------------|
+|        IV | 12 bytes | GCM nonce              |
+|        CT | N bytes  | Ciphertext             |
+|       TAG | 16 bytes | GCM authentication tag |
+
+`length = 12 + N + 16`.
+
+### AES key origin
+
+Derived from TLS exporter:
+
+```cpp
+SSL_export_keying_material(
+    ssl, key, 32,
+    "urpc_app_key_v1",
+    ...);
+```
+
+Constraints:
+
+* Works only when TLS/mTLS is active.
+* Requires `app_encryption = true` on both endpoints.
+* Header is not encrypted.
 
 ---
 
@@ -137,100 +212,80 @@ type == Response
 flags has FLAG_ERROR
 ```
 
-Then payload contains a binary error structure:
+then (after AES decrypt if `FLAG_ENCRYPTED`):
 
-| Offset | Field   | Type    | Size | Endianness | Description                    |
-|-------:|---------|---------|------|------------|--------------------------------|
-|      0 | code    | uint32  | 4    | BE         | Application error code         |
-|      4 | msg_len | uint32  | 4    | BE         | UTF-8 message length           |
-|      8 | message | char[]  | N    | —          | Human-readable message         |
-|    8+N | details | uint8[] | M    | —          | Optional opaque binary details |
-
-Constraints:
-
-* `payload.size() >= 8`
-* `payload.size() >= 8 + msg_len`
-
-Construction:
-
-* Server builds this in `RpcConnection::send_simple_error()`
-* Client parses this in `RpcClient::parse_error_payload()`
-
-If error is detected:
-
-* `call->error = true`
-* `call->response` remains empty
+| Offset | Field   | Type    | Size | Endianness | Description            |
+|-------:|---------|---------|------|------------|------------------------|
+|      0 | code    | uint32  | 4    | BE         | Application error code |
+|      4 | msg_len | uint32  | 4    | BE         | UTF-8 message length   |
+|      8 | message | char[]  | N    | —          | UTF-8 text             |
+|    8+N | details | uint8[] | M    | —          | Optional data          |
 
 ---
 
 # Ping / Pong frames
 
-Used by `RpcClient::async_ping()` and `RpcConnection::handle_ping()`.
+Always unencrypted and with no payload.
 
 ### Ping
 
 ```
 type      = Ping
-flags     = END_STREAM
-stream_id = unique non-zero id
+flags     = FLAG_END_STREAM (+ FLAG_TLS / FLAG_MTLS)
+stream_id = unique (>0)
 method_id = 0
 length    = 0
-payload   = empty
 ```
 
 ### Pong
 
 ```
 type      = Pong
-flags     = END_STREAM
+flags     = FLAG_END_STREAM (+ TLS bits)
 stream_id = same as Ping
 method_id = same as Ping
 length    = 0
-payload   = empty
 ```
 
 ---
 
 # Stream IDs
 
-* 32-bit unsigned integer
-* `0` is reserved
-* Client assigns stream IDs sequentially
-* Response always uses the same `stream_id`
-* When `END_STREAM` is set, the logical stream is closed
+* 32-bit unsigned
+* `0` reserved
+* client increments sequentially
+* Response echoes the same ID
+* END_STREAM closes logical stream
 
 ---
 
 # Method IDs
 
-Method IDs are 64-bit hashes (FNV-1a). Same value is used:
+64-bit FNV-1a.
 
-* in Request header
-* in Response header
-
-Two ways to produce them:
-
-### Runtime
+Runtime:
 
 ```cpp
 uint64_t id = fnv1a64_rt("Example.Echo");
 ```
 
-### Compile-time
+Compile-time:
 
 ```cpp
 constexpr uint64_t EchoId = method_id("Example.Echo");
 ```
 
-Compile-time IDs guarantee an identical constant across client/server.
-
 ---
 
 # Summary
 
-* uRPC’s wire format is a simple **28-byte header** + binary payload.
-* All multibyte integers are **big-endian**.
-* Transport layer (TCP/TLS/mTLS) does not change framing.
-* Error semantics are fully binary.
-* Ping/Pong uses standard frames; no side channels exist.
-* Protocol is designed to be trivially parsed and extremely fast.
+* uRPC wire format = **28-byte plaintext header + payload**.
+* Header is **never encrypted** (not by TLS, not by AES).
+* Payload may be:
+
+    * raw
+    * TLS-protected (transport layer)
+    * AES-256-GCM encrypted (`FLAG_ENCRYPTED`)
+* Transport does not affect framing.
+* Ping/Pong are minimal, empty frames.
+* Protocol remains fast, deterministic, simple to parse.

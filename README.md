@@ -18,7 +18,7 @@ Every message on the wire is a **Frame**:
 ## Header
 
 **Size:** 28 bytes  
-**Byte order:** Big-Endian
+**Byte order:** Big-Endiann
 
 Layout:
 
@@ -28,14 +28,19 @@ uint8   version     // protocol version, currently 1
 uint8   type        // frame type (see FrameType table)
 uint16  flags       // bitmask (END_STREAM, ERROR, COMPRESSED, …)
 uint32  reserved    // must be 0; reserved for future protocol extensions
-uint32  stream_id   // logical stream id (similar to HTTP/2 stream id)
-uint64  method_id   // FNV1a64("Service.Method") for requests; echoed in responses
+uint32  stream_id   // logical RPC stream ID
+uint64  method_id   // FNV1a64("Service.Method")
 uint32  length      // payload size in bytes
 ```
 
 The `reserved` field is included in the header but is not used by the current
 protocol version. Implementations MUST send it as zero and MUST ignore its value
 when receiving.
+
+**Important:**
+TLS/mTLS encrypt the *transport stream*, but the protocol header is still parsed
+normally because OpenSSL decrypts before delivering bytes to `async_read`.
+App-level AES (if enabled) encrypts **only the payload**, never the header.
 
 ---
 
@@ -44,20 +49,20 @@ when receiving.
 ```text
 0 = Request
 1 = Response
-2 = Stream   // reserved for future streaming responses
-3 = Cancel   // client asks server to cancel a running call
-4 = Ping     // liveness probe
-5 = Pong     // response to Ping
+2 = Stream   // reserved for future streaming
+3 = Cancel
+4 = Ping
+5 = Pong
 ```
 
-| Type | Name     | Direction | Description                       |
-|------|----------|-----------|-----------------------------------|
-| 0    | Request  | C → S     | RPC request                       |
-| 1    | Response | S → C     | RPC response                      |
-| 2    | Stream   | S → C     | Chunk of streaming response (TBD) |
-| 3    | Cancel   | C → S     | Cooperative cancellation          |
-| 4    | Ping     | C ↔ S     | Health check                      |
-| 5    | Pong     | C ↔ S     | Health check response             |
+| Type | Name     | Direction | Description                |
+|------|----------|-----------|----------------------------|
+| 0    | Request  | C → S     | RPC request                |
+| 1    | Response | S → C     | RPC response               |
+| 2    | Stream   | S → C     | Streaming chunk (reserved) |
+| 3    | Cancel   | C → S     | Cooperative cancellation   |
+| 4    | Ping     | C ↔ S     | Health check               |
+| 5    | Pong     | C ↔ S     | Health check response      |
 
 ---
 
@@ -66,32 +71,36 @@ when receiving.
 `flags` is a bitmask:
 
 * `0x01` — `END_STREAM`
-* `0x02` — `ERROR` (Response indicates an application error)
-* `0x04` — `COMPRESSED` (payload is compressed)
+* `0x02` — `ERROR`
+* `0x04` — `COMPRESSED`
+* `0x08` — `TLS` (transport is TLS)
+* `0x10` — `MTLS` (mutual TLS)
+* `0x20` — `ENCRYPTED` (payload encrypted with app-level AES)
 
 Rules:
 
 * Request frames MUST NOT set `ERROR`.
-* Response frames set `ERROR` if they contain an error payload.
+* Response frames MUST set `ERROR` when they carry an error payload.
+* AES and TLS flags **never** imply header encryption — only payload (AES) or entire transport (TLS).
 
 ---
 
 ## Request / Response Flow
 
 1. Client opens a connection (TCP or TLS/mTLS).
-2. Client sends a **Request** with a unique stream ID and method ID.
-3. Server invokes the handler associated with the method ID.
-4. Handler returns `std::vector<uint8_t>` as binary response.
-5. Server sends a **Response** with the same stream ID and method ID.
-6. Client matches the response and resumes the awaiting coroutine.
+2. Client sends a Request with unique `stream_id` and `method_id`.
+3. Server dispatches to registered handler.
+4. Handler returns a binary vector.
+5. Server sends Response with same `stream_id`.
+6. Client matches by `stream_id`.
+
+Multiplexing allows many in-flight RPCs on one connection.
 
 ---
 
 ## Errors
 
-Errors are encoded as **binary error payloads**, not JSON.
-
-If `ERROR` flag is set, the payload structure is:
+Errors are encoded as binary payloads.
 
 ```
 +-----------------------+-----------------------+---------------------------+
@@ -99,261 +108,139 @@ If `ERROR` flag is set, the payload structure is:
 +-----------------------+-----------------------+---------------------------+
 ```
 
-All integers are **big-endian**.
-
-### Error payload format
-
-| Field   | Type   | Description                       |
-|---------|--------|-----------------------------------|
-| code    | u32 BE | Application-defined error code    |
-| msg_len | u32 BE | Length of the UTF-8 error message |
-| message | bytes  | Human-readable error message      |
-| details | bytes  | Optional opaque binary blob       |
-
-### Example: server error
-
-```cpp
-co_await send_simple_error(ctx, 404, "Unknown method");
-```
-
-Produces a `Response` frame:
-
-* `type = Response`
-* `flags = END_STREAM | ERROR`
-* `payload = binary error payload`
-* `stream_id = original stream`
-* `method_id = original method`
-
 ### Client reaction
 
-On `ERROR`:
+If ERROR flag is set:
 
-* The client marks the pending call as failed and decodes `code` / `message` internally.
-* The response vector returned by the high-level C++ client is **empty**.
-* Other implementations may choose to expose `code`, `message`, and `details` directly.
+* client marks call as failed,
+* extracts code/message,
+* the returned vector is empty.
 
 ---
 
 ## Ping / Pong
 
-Used for connection health checks.
+Used for liveness checks.
 
-**Ping (client → server):**
+**Ping:**
 
 ```
 type      = 4
 flags     = END_STREAM
-stream_id = arbitrary non-zero
+stream_id = non-zero
 length    = 0
-payload   = empty
 ```
 
-**Pong (server → client):**
+**Pong:**
 
 ```
 type      = 5
 flags     = END_STREAM
 stream_id = same as Ping
 length    = 0
-payload   = empty
 ```
-
-`RpcConnection::handle_ping` automatically sends `Pong`.
 
 ---
 
 ## Stream IDs
 
-* `stream_id = 0` is reserved.
-* Every in-flight RPC uses a unique non-zero `stream_id`.
-* A `Response` must use the same `stream_id` as the `Request`.
-* When `END_STREAM` is set, the logical stream is closed.
+* `0` is reserved
+* client allocates increasing non-zero IDs
+* response must reuse request's ID
+* stream closes on END_STREAM
 
 ---
 
 ## Method IDs
 
-Method IDs are 64-bit FNV1a hashes:
+64-bit FNV1a:
 
 ```cpp
 uint64_t id = urpc::method_id("Example.Echo");
 ```
 
-Server registration:
+Compile-time:
 
 ```cpp
-server.register_method_ct<urpc::method_id("Example.Echo")>(
-    [](urpc::RpcContext& ctx,
-       std::span<const uint8_t> body)
-    -> usub::uvent::task::Awaitable<std::vector<uint8_t>>
-    {
-        std::vector<uint8_t> out(body.begin(), body.end());
-        co_return out;
-    });
+server.register_method_ct<urpc::method_id("Example.Echo")>(handler);
 ```
-
-The response always reuses the request’s `method_id`.
 
 ---
 
 # **Optional TLS and mTLS**
 
-uRPC supports switching transports without recompiling the protocol:
+Enabling TLS/mTLS is purely a transport decision:
 
-* **Plain TCP**
-* **TLS**
-* **Mutual TLS (mTLS)** — both client and server verify certificates
+* framing stays the same
+* header remains plaintext at the protocol level
+* OpenSSL decrypts before `async_read`
+* handler logic unchanged
 
-Transport selection is configured in:
+mTLS additionally verifies client certificates.
 
-* `RpcClientConfig`
-* `RpcServerConfig`
+---
 
-When TLS/mTLS is enabled:
+# **App-level AES Encryption**
 
-* Transport automatically wraps the underlying TCP socket
-* No changes to protocol, wire format, or handlers
-* No difference in Request/Response API
+If enabled (both sides agree):
 
-Everything above remains identical.
+* a per-connection AES-256-GCM key is derived via TLS exporter
+* payload is replaced by:
 
-## Example mTLS certificate generation
-
-1. Create certs folder:
-
-```bash
-mkdir certs
-cd certs 
+```
+IV[12] + ciphertext[N] + TAG[16]
 ```
 
-2. CA:
+* header is **never encrypted**
+* flags include `ENCRYPTED`
 
-```bash
-# CA key
-openssl genrsa -out ca.key 4096
-
-# CA cert (self-signed)
-openssl req -x509 -new -nodes \
-  -key ca.key \
-  -sha256 -days 3650 \
-  -out ca.crt \
-  -subj "/C=XX/ST=TestState/L=TestCity/O=urpc-CA/OU=Dev/CN=urpc-test-ca"
-```
-
-3. Server certificate:
-
-```bash
-# Server key
-openssl genrsa -out server.key 2048
-
-# CSR
-openssl req -new \
-  -key server.key \
-  -out server.csr \
-  -subj "/C=XX/ST=TestState/L=TestCity/O=urpc-Server/OU=Dev/CN=localhost"
-
-openssl x509 -req \
-  -in server.csr \
-  -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out server.crt \
-  -days 365 -sha256
-```
-
-4. Client certificate:
-
-```bash
-# Client key
-openssl genrsa -out client.key 2048
-
-# CSR
-openssl req -new \
-  -key client.key \
-  -out client.csr \
-  -subj "/C=XX/ST=TestState/L=TestCity/O=urpc-Client/OU=Dev/CN=urpc-client"
-
-openssl x509 -req \
-  -in client.csr \
-  -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out client.crt \
-  -days 365 -sha256
-```
+AES works **on top of TLS** or plain TCP (if you provide your own key).
 
 ---
 
 # **Command-line client (urpc_cli)**
 
-uRPC includes a small coroutine-based CLI for testing RPC endpoints.
+```bash
+urpc_cli --host 127.0.0.1 --port 45900 --method Example.Echo --data "hello"
+```
 
-### Example (TCP)
+TLS:
 
 ```bash
-urpc_cli \
-  --host 127.0.0.1 \
-  --port 45900 \
-  --method Example.Echo \
-  --data "hello"
+urpc_cli --tls --tls-ca ca.crt \
+         --tls-server-name localhost \
+         --host 127.0.0.1 --port 45900 \
+         --method Example.Echo --data "hi"
 ```
 
-### Example (TLS)
+mTLS:
 
 ```bash
-urpc_cli \
-  --host localhost \
-  --port 45900 \
-  --method Example.Echo \
-  --data "hello over TLS" \
-  --tls \
-  --tls-ca ./ca.crt \
-  --tls-server-name localhost
+urpc_cli --tls \
+         --tls-ca ./ca.crt \
+         --tls-cert ./client.crt \
+         --tls-key ./client.key \
+         --tls-server-name localhost \
+         --method Example.Echo \
+         --data "hello secure"
 ```
 
-### Example (mTLS)
+AES:
 
 ```bash
-urpc_cli \
-  --host localhost \
-  --port 45900 \
-  --method Example.Echo \
-  --data "hello from mTLS" \
-  --tls \
-  --tls-ca ./ca.crt \
-  --tls-cert ./client.crt \
-  --tls-key ./client.key \
-  --tls-server-name localhost
-```
-
-The CLI prints both UTF-8 and hex output for debugging:
-
-```
----- RESPONSE (utf8) ----
-hello from mTLS
-
----- RESPONSE (hex) ----
-68 65 6c 6c 6f …
+urpc_cli --aes --aes-key hex:001122334455...
 ```
 
 ---
 
 ## Payload
 
-uRPC does not enforce a serialization format.
-The payload is an opaque, length-prefixed binary blob:
+Payload is opaque and length-prefixed:
 
 * JSON
-* MsgPack
 * Protobuf
-* raw structs
+* MsgPack
 * custom binary formats
-
-`RpcClient` and `RpcConnection` only handle framing.
-Application code only deals with:
-
-```cpp
-std::span<const uint8_t>
-std::vector<uint8_t>
-```
-
-No assumptions about content.
 
 ---
 

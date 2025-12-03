@@ -1,6 +1,4 @@
-//
-// Created by root on 12/1/25.
-//
+// TlsConfig.h
 
 #ifndef TLSCONFIG_H
 #define TLSCONFIG_H
@@ -14,11 +12,14 @@ namespace urpc
         bool enabled{false};
         bool verify_peer{true};
 
+        bool app_encryption{true};
+
         std::string ca_cert_file;
         std::string client_cert_file;
         std::string client_key_file;
 
         std::string server_name;
+        int socket_timeout_ms{-1};
     };
 
     struct TlsServerConfig
@@ -26,9 +27,12 @@ namespace urpc
         bool enabled{false};
         bool require_client_cert{false};
 
+        bool app_encryption{true};
+
         std::string ca_cert_file;
         std::string server_cert_file;
         std::string server_key_file;
+        int socket_timeout_ms{-1};
     };
 }
 

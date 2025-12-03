@@ -28,8 +28,8 @@ namespace urpc
     {
     public:
         RpcServer(std::string host,
-                             uint16_t port,
-                             int threads);
+                  uint16_t port,
+                  int threads);
 
         explicit RpcServer(RpcServerConfig cfg);
 

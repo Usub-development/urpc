@@ -1,3 +1,4 @@
+// TlsRpcStream.cpp
 //
 // Created by root on 01.12.2025.
 //
@@ -6,6 +7,8 @@
 
 #include <openssl/x509v3.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 namespace urpc
 {
@@ -112,8 +115,6 @@ namespace urpc
         BIO_free(mem);
         return pem;
     }
-
-    // ===== SSL_CTX фабрики =====
 
     static std::shared_ptr<SSL_CTX> make_client_ctx(const TlsClientConfig& cfg)
     {
@@ -238,8 +239,6 @@ namespace urpc
         return ctx;
     }
 
-    // ===== TlsRpcStream =====
-
     TlsRpcStream::TlsRpcStream(SocketType&& sock,
                                std::shared_ptr<SSL_CTX> ctx,
                                Mode mode,
@@ -266,7 +265,6 @@ namespace urpc
             return;
         }
 
-        // используем memory BIO, SSL сам сокет не трогает
         BIO* rbio = BIO_new(BIO_s_mem());
         BIO* wbio = BIO_new(BIO_s_mem());
         SSL_set_bio(this->ssl_, rbio, wbio);
@@ -307,7 +305,6 @@ namespace urpc
 
         if (this->ssl_)
         {
-            // Пытаемся корректно отправить close_notify
             SSL_shutdown(this->ssl_);
             SSL_free(this->ssl_);
             this->ssl_ = nullptr;
@@ -354,6 +351,41 @@ namespace urpc
         this->peer_.pem = cert_to_pem(cert);
 
         X509_free(cert);
+    }
+
+    bool TlsRpcStream::derive_app_key()
+    {
+        if (!this->ssl_)
+            return false;
+
+        const char label[] = "urpc-app-key";
+        std::array<uint8_t, 32> key{};
+
+        int rc = SSL_export_keying_material(
+            this->ssl_,
+            key.data(),
+            static_cast<size_t>(key.size()),
+            label,
+            sizeof(label) - 1,
+            nullptr,
+            0,
+            0);
+        if (rc != 1)
+        {
+            log_last_ssl_error("SSL_export_keying_material");
+            return false;
+        }
+
+        this->app_key_ = key;
+        this->has_app_key_ = true;
+
+#if URPC_LOGS
+        usub::ulog::info(
+            "TlsRpcStream::derive_app_key: key derived this={}",
+            static_cast<void*>(this));
+#endif
+
+        return true;
     }
 
     usub::uvent::task::Awaitable<bool> TlsRpcStream::flush_wbio()
@@ -453,14 +485,45 @@ namespace urpc
                     static_cast<void*>(this));
 #endif
                 this->fill_peer_identity();
+
+                static const char kLabel[] = "urpc_app_key_v1";
+                std::array<uint8_t, 32> key{};
+                int ok = SSL_export_keying_material(
+                    this->ssl_,
+                    key.data(),
+                    static_cast<size_t>(key.size()),
+                    kLabel,
+                    sizeof(kLabel) - 1,
+                    nullptr,
+                    0,
+                    0);
+                if (ok == 1)
+                {
+                    this->app_cipher_.key = key;
+                    this->app_cipher_.valid = true;
+#if URPC_LOGS
+                    usub::ulog::info(
+                        "TlsRpcStream::do_handshake: app key derived (AES-256-GCM)");
+#endif
+                }
+                else
+                {
+#if URPC_LOGS
+                    usub::ulog::warn(
+                        "TlsRpcStream::do_handshake: SSL_export_keying_material failed, "
+                        "app-level encryption disabled");
+#endif
+                    this->app_cipher_.valid = false;
+                }
+
                 co_return true;
             }
 
             int err = SSL_get_error(this->ssl_, rc);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             {
-                bool ok = co_await this->read_into_rbio(kMaxChunk);
-                if (!ok) co_return false;
+                bool ok2 = co_await this->read_into_rbio(kMaxChunk);
+                if (!ok2) co_return false;
                 continue;
             }
 
@@ -468,6 +531,7 @@ namespace urpc
             co_return false;
         }
     }
+
 
     usub::uvent::task::Awaitable<ssize_t> TlsRpcStream::async_read(
         usub::uvent::utils::DynamicBuffer& buf,
@@ -479,7 +543,7 @@ namespace urpc
         {
 #if URPC_LOGS
             usub::ulog::debug(
-                "TlsRpcStream::async_read: this={} fd={} ssl_ is null (already shutdown), return 0",
+                "TlsRpcStream::async_read: this={} fd={} ssl_ is null, return 0",
                 static_cast<void*>(this),
                 this->socket_.get_raw_header()->fd);
 #endif
@@ -649,17 +713,42 @@ namespace urpc
                           const TlsClientConfig& cfg)
     {
         net::TCPClientSocket sock;
-        auto res = co_await sock.async_connect(
-            host.c_str(),
-            std::to_string(port).c_str());
-        if (res.has_value())
+
+        if (cfg.socket_timeout_ms > 0)
+            sock.set_timeout_ms(cfg.socket_timeout_ms);
+
+        auto port_str = std::to_string(port);
+
+        if (cfg.socket_timeout_ms > 0)
         {
+            auto res = co_await sock.async_connect(
+                host.c_str(),
+                port_str.c_str(),
+                std::chrono::milliseconds{cfg.socket_timeout_ms});
+            if (res.has_value())
+            {
 #if URPC_LOGS
-            usub::ulog::error(
-                "TlsRpcStream::connect: async_connect failed ec={}",
-                res.value());
+                usub::ulog::error(
+                    "TlsRpcStream::connect: async_connect failed ec={}",
+                    res.value());
 #endif
-            co_return nullptr;
+                co_return nullptr;
+            }
+        }
+        else
+        {
+            auto res = co_await sock.async_connect(
+                host.c_str(),
+                port_str.c_str());
+            if (res.has_value())
+            {
+#if URPC_LOGS
+                usub::ulog::error(
+                    "TlsRpcStream::connect: async_connect failed ec={}",
+                    res.value());
+#endif
+                co_return nullptr;
+            }
         }
 
         auto ctx = make_client_ctx(cfg);
@@ -694,6 +783,9 @@ namespace urpc
         {
             co_return nullptr;
         }
+
+        if (cfg.socket_timeout_ms > 0)
+            socket.set_timeout_ms(cfg.socket_timeout_ms);
 
         auto stream = TlsRpcStream::create(
             std::move(socket),

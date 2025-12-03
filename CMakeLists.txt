@@ -112,6 +112,10 @@ if (URPC_BUILD_EXAMPLES)
     target_link_libraries(urpc_example_server_mtls PRIVATE urpc)
     target_compile_definitions(urpc_example_server_mtls PRIVATE DEV_STAGE=${DEV_STAGE})
 
+    add_executable(urpc_example_server_aes examples/main_aes.cpp)
+    target_link_libraries(urpc_example_server_aes PRIVATE urpc)
+    target_compile_definitions(urpc_example_server_aes PRIVATE DEV_STAGE=${DEV_STAGE})
+
     add_executable(urpc_example_client examples/main_client.cpp)
     target_link_libraries(urpc_example_client PRIVATE urpc)
     target_compile_definitions(urpc_example_client PRIVATE DEV_STAGE=${DEV_STAGE})

@@ -46,18 +46,44 @@ namespace urpc
                     "TlsRpcStreamFactory::create_client_stream: TLS disabled, using plain TCP");
 #endif
                 net::TCPClientSocket sock;
-                auto res = co_await sock.async_connect(
-                    host.c_str(),
-                    std::to_string(port).c_str());
-                if (res.has_value())
+
+                if (client_cfg_.socket_timeout_ms > 0)
+                    sock.set_timeout_ms(client_cfg_.socket_timeout_ms);
+
+                auto port_str = std::to_string(port);
+
+                if (client_cfg_.socket_timeout_ms > 0)
                 {
+                    auto res = co_await sock.async_connect(
+                        host.c_str(),
+                        port_str.c_str(),
+                        std::chrono::milliseconds{client_cfg_.socket_timeout_ms});
+                    if (res.has_value())
+                    {
 #if URPC_LOGS
-                    usub::ulog::error(
-                        "TlsRpcStreamFactory::create_client_stream (plain): async_connect failed ec={}",
-                        res.value());
+                        usub::ulog::error(
+                            "TlsRpcStreamFactory::create_client_stream (plain): async_connect failed ec={}",
+                            res.value());
 #endif
-                    co_return nullptr;
+                        co_return nullptr;
+                    }
                 }
+                else
+                {
+                    auto res = co_await sock.async_connect(
+                        host.c_str(),
+                        port_str.c_str());
+                    if (res.has_value())
+                    {
+#if URPC_LOGS
+                        usub::ulog::error(
+                            "TlsRpcStreamFactory::create_client_stream (plain): async_connect failed ec={}",
+                            res.value());
+#endif
+                        co_return nullptr;
+                    }
+                }
+
                 auto stream = std::make_shared<TcpRpcStream>(std::move(sock));
                 co_return stream;
             }

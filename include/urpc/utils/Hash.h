@@ -8,10 +8,10 @@
 #include <string_view>
 #include <type_traits>
 #include <cstdint>
+#include <string>
 
 namespace urpc
 {
-
     template <class T>
     concept StringLike =
         std::same_as<std::remove_cvref_t<T>, std::string> ||
@@ -53,7 +53,7 @@ namespace urpc
     template <StringLike T>
     constexpr uint64_t method_id(T&& str)
     {
-        return fnv1a64_rt(std::forward<std::string>(str));
+        return fnv1a64_rt(std::string_view{std::forward<T>(str)});
     }
 }
 

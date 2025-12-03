@@ -9,6 +9,7 @@ The transport layer is responsible for:
 - connection shutdown
 - optional TLS/mTLS handshake
 - optional certificate validation
+- optional app-level AES payload encryption (only payload, never header)
 
 The protocol itself does **not** depend on TCP or OpenSSL directly.
 
@@ -85,7 +86,7 @@ Factories produce:
 
 * plain TCP streams (`TcpRpcStream`);
 * TLS/mTLS streams (`TlsRpcStream`);
-* custom transports (e.g. QUIC in the future).
+* custom transports (QUIC, pipes, etc.).
 
 ---
 
@@ -118,7 +119,7 @@ Properties:
 
 # TlsRpcStream (TLS / mTLS)
 
-TLS transport is a drop-in implementation of `IRpcStream`, using OpenSSL in non-blocking mode and uvent coroutines.
+TLS transport is a drop-in implementation of `IRpcStream`, using OpenSSL in non-blocking mode with uvent coroutines.
 
 Provided by:
 
@@ -133,35 +134,37 @@ class TlsRpcStream        : public IRpcStream;
 
 1. Create TCP socket.
 2. Connect via `async_connect`.
-3. Initialize OpenSSL SSL object.
-4. Configure CA, certificate, private key, server-name (SNI).
-5. Perform async TLS handshake (loop around SSL_ERROR_WANT_READ/WRITE).
-6. Return ready TLS stream.
+3. Initialize SSL object.
+4. Configure CA, certificate, key, server-name (SNI).
+5. Perform async TLS handshake.
+6. Derive AES exporter keys (if app-level encryption is enabled).
+7. Return TLS stream.
 
 ### Server-side flow
 
 `create_server_stream(TCPClientSocket&& sock)`:
 
-1. Attach SSL to accepted socket.
-2. Load server certificate and key.
-3. If `require_client_cert == true` → enable mTLS.
+1. Wrap socket with SSL.
+2. Load server cert/key.
+3. Enable mTLS if required.
 4. Perform async handshake.
-5. Verify client certificate (if mTLS).
-6. Return ready TLS stream.
+5. Verify client certificate if mTLS.
+6. Derive AES exporter keys (if enabled).
+7. Return stream.
+
+### Header visibility under TLS
+
+* TLS encrypts the **transport** stream.
+* The **uRPC header (28 bytes) is still parsed as plaintext**, because OpenSSL
+  decrypts it before delivering bytes to `async_read`.
 
 ### Peer certificate
 
-Server and client may access peer certificate:
-
 ```cpp
 auto info = stream->peer_certificate();
-info.subject;
-info.issuer;
-info.san_dns;
-info.raw_der;
 ```
 
-Used for mTLS authorization, logging, etc.
+Used for authorization, logging, auditing.
 
 ---
 
@@ -181,23 +184,34 @@ inline task::Awaitable<bool> send_frame(
     std::span<const uint8_t> payload);
 ```
 
+### AES note
+
+If app-level AES is enabled:
+
+* encryption happens **before** calling `send_frame`.
+* the payload passed to `send_frame` is already:
+
+```
+IV[12] + ciphertext[...] + TAG[16]
+```
+
+`send_frame` itself is unaware of encryption.
+
 ### `write_all`
 
 * Performs a **single write** call.
 * Returns `false` on `<= 0`.
 
-(Safe because uRPC frames are small and under a mutex. The transport already guarantees full-write or error semantics.)
-
 ### `send_frame`
 
-1. Serializes the header into a local **28-byte** array.
-2. Calls `write_all` on the header.
-3. Calls `write_all` on the payload (if any).
+1. Serializes the 28-byte header.
+2. Calls `write_all` for header.
+3. Calls `write_all` for payload (raw or AES-encrypted).
 
 Used by:
 
-* `RpcClient` (`async_call`, `async_ping`, responses to server pings)
-* `RpcConnection` (`send_response`, errors, `handle_ping`)
+* `RpcClient`
+* `RpcConnection`
 
 ---
 
@@ -207,16 +221,10 @@ Method IDs are **64-bit FNV-1a** hashes of method names.
 
 Why:
 
-* Fast
-* Deterministic
-* Low collision probability
-* Compile-time viable
-
-All requests use:
-
-```
-method_id: u64
-```
+* deterministic
+* fast
+* collision probability extremely low
+* trivial compile-time evaluation
 
 ### Runtime hashing
 
@@ -224,17 +232,9 @@ method_id: u64
 uint64_t fnv1a64_rt(std::string_view s) noexcept;
 ```
 
-Used by:
-
-* `rpcServer.register_method("name", fn)`
-* `client->async_call("name", body)`
-
 ### Compile-time hashing
 
 ```cpp
-template <size_t N>
-consteval uint64_t fnv1a64_ct(const char (&str)[N]);
-
 template <size_t N>
 consteval uint64_t method_id(const char (&str)[N]);
 ```
@@ -242,42 +242,35 @@ consteval uint64_t method_id(const char (&str)[N]);
 Used by:
 
 ```cpp
-static constexpr uint64_t EchoId = urpc::method_id("Example.Echo");
-
-server.register_method_ct<EchoId>(handler);
-co_await client->async_call_ct<EchoId>(payload);
+server.register_method_ct<method_id("Example.Echo")>(fn);
+client->async_call_ct<method_id("Example.Echo")>(payload);
 ```
-
-Compile-time IDs guarantee:
-
-* fully static value
-* zero allocations
-* no runtime hashing
 
 ---
 
 # Summary
 
-Transport layer guarantees:
+Transport layer provides:
 
 * async read/write
 * clean shutdown
 * optional TLS/mTLS
-* peer-certificate access
-* no assumption about framing or semantics
+* optional per-connection AES key derivation
+* peer certificate access
 
-Protocol layer guarantees:
+Protocol layer provides:
 
-* header serialization
-* payload integrity
-* method-id hashing
-* multiplexing by stream id
+* 28-byte plaintext header (always)
+* optional payload encryption (AES-256-GCM)
+* multiplexing via stream IDs
+* method resolution via 64-bit FNV-1a hashes
 
-Client and server exchange only:
+Client and server exchange only three transport operations:
 
 ```
-IRpcStream::async_read / async_write
-IRpcStream::shutdown()
+async_read
+async_write
+shutdown
 ```
 
-Everything else (framing, method dispatch, errors, pings) lives entirely above the transport.
+Everything else—framing, flags, AES, errors, pings—lives fully above the transport.

@@ -6,6 +6,7 @@
 #define URPC_TLSRPCSTREAM_H
 
 #include <memory>
+#include <array>
 
 #include <openssl/ssl.h>
 
@@ -13,6 +14,7 @@
 #include <uvent/tasks/Awaitable.h>
 #include <uvent/utils/buffer/DynamicBuffer.h>
 
+#include <urpc/crypto/AppCrypto.h>
 #include <urpc/transport/IRPCStream.h>
 #include <urpc/transport/TlsConfig.h>
 #include <urpc/transport/TlsPeer.h>
@@ -60,6 +62,20 @@ namespace urpc
             return this->peer_.authenticated ? &this->peer_ : nullptr;
         }
 
+        [[nodiscard]] bool get_app_secret_key(
+            std::array<uint8_t, 32>& out_key) const noexcept override
+        {
+            if (!this->has_app_key_)
+                return false;
+            out_key = this->app_key_;
+            return true;
+        }
+
+        [[nodiscard]] const AppCipherContext* app_cipher() const noexcept
+        {
+            return this->app_cipher_.valid ? &this->app_cipher_ : nullptr;
+        }
+
         void shutdown() override;
 
         ~TlsRpcStream() override;
@@ -77,6 +93,7 @@ namespace urpc
         usub::uvent::task::Awaitable<bool> read_into_rbio(std::size_t max_chunk);
 
         void fill_peer_identity();
+        bool derive_app_key();
 
         SocketType socket_;
         std::shared_ptr<SSL_CTX> ctx_;
@@ -86,6 +103,11 @@ namespace urpc
         TlsClientConfig client_cfg_;
         TlsServerConfig server_cfg_;
         bool shutdown_called_{false};
+
+        std::array<uint8_t, 32> app_key_{};
+        bool has_app_key_{false};
+
+        AppCipherContext app_cipher_;
     };
 }
 

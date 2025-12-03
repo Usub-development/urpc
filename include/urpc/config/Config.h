@@ -18,6 +18,8 @@ namespace urpc
         std::string host;
         uint16_t port{0};
         std::shared_ptr<IRpcStreamFactory> stream_factory;
+        uint32_t ping_interval_ms{0};
+        int socket_timeout_ms{-1};
     };
 
     struct RpcServerConfig
