@@ -53,7 +53,7 @@ namespace urpc
             "RpcServer: register_method method_id={}",
             method_id);
 #endif
-        this->registry_.register_method(method_id, fn);
+        this->registry_.register_method(method_id, std::move(fn));
     }
 
     void RpcServer::register_method(std::string_view name,
@@ -63,7 +63,7 @@ namespace urpc
         usub::ulog::debug(
             "RpcServer: register_method name={}", name);
 #endif
-        this->registry_.register_method(name, fn);
+        this->registry_.register_method(name, std::move(fn));
     }
 
     usub::uvent::task::Awaitable<void> RpcServer::run_async()
