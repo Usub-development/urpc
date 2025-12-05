@@ -802,17 +802,13 @@ namespace urpc
 
                     if (!call)
                     {
-                        // Критическая протокольная ошибка: сервер прислал
-                        // ответ на незарегистрированный stream_id.
-                        // Рвём соединение, чтобы не оставлять висящие async_call.
 #if URPC_LOGS
                         usub::ulog::error(
                             "RpcClient::reader_loop: no PendingCall for "
                             "sid={} -> protocol error, closing connection",
                             frame.header.stream_id);
 #endif
-                        this->close();  // shutdown TCP/TLS
-                        // выходим из цикла, cleanup ниже разбудит всех ожидающих
+                        this->close();
                         goto reader_loop_exit;
                     }
 
