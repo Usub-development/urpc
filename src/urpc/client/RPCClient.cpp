@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <array>
+#include <ranges>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -29,7 +30,8 @@ namespace urpc
         return tls->app_cipher();
     }
 
-    static uint16_t build_security_flags_client(const std::shared_ptr<IRpcStream>& stream)
+    static uint16_t build_security_flags_client(
+        const std::shared_ptr<IRpcStream>& stream)
     {
         const RpcPeerIdentity* peer = nullptr;
         if (stream)
@@ -43,232 +45,6 @@ namespace urpc
                 flags |= FLAG_MTLS;
         }
         return flags;
-    }
-
-    static bool aes256_gcm_encrypt_client(
-        const uint8_t* key,
-        const uint8_t* iv,
-        size_t iv_len,
-        const uint8_t* in,
-        size_t in_len,
-        uint8_t* out,
-        uint8_t* tag)
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-            return false;
-
-        int len = 0;
-        int out_len = 0;
-        bool ok = true;
-
-        ok = ok && (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
-        ok = ok && (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        if (in_len > 0)
-        {
-            ok = ok && (EVP_EncryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
-            out_len = len;
-        }
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_EncryptFinal_ex(ctx, out + out_len, &len) == 1);
-        out_len += len;
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1);
-        EVP_CIPHER_CTX_free(ctx);
-
-        if (!ok)
-            return false;
-        if (out_len != static_cast<int>(in_len))
-            return false;
-
-        return true;
-    }
-
-    static bool aes256_gcm_decrypt_client(
-        const uint8_t* key,
-        const uint8_t* iv,
-        size_t iv_len,
-        const uint8_t* in,
-        size_t in_len,
-        const uint8_t* tag,
-        uint8_t* out)
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-            return false;
-
-        int len = 0;
-        int out_len = 0;
-        bool ok = true;
-
-        ok = ok && (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
-        ok = ok && (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        if (in_len > 0)
-        {
-            ok = ok && (EVP_DecryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
-            out_len = len;
-        }
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) == 1);
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        int final_rc = EVP_DecryptFinal_ex(ctx, out + out_len, &len);
-        EVP_CIPHER_CTX_free(ctx);
-
-        if (final_rc <= 0)
-            return false;
-
-        out_len += len;
-        if (out_len != static_cast<int>(in_len))
-            return false;
-
-        return true;
-    }
-
-    static std::vector<uint8_t> encrypt_body_only_client(
-        const std::shared_ptr<IRpcStream>& stream,
-        uint16_t& flags,
-        std::span<const uint8_t> body)
-    {
-        if (body.empty())
-            return {};
-
-        if (!stream)
-        {
-            std::vector<uint8_t> out;
-            out.reserve(body.size());
-            out.insert(out.end(), body.begin(), body.end());
-            return out;
-        }
-
-        std::array<uint8_t, 32> key{};
-        if (!stream->get_app_secret_key(key))
-        {
-            std::vector<uint8_t> out;
-            out.reserve(body.size());
-            out.insert(out.end(), body.begin(), body.end());
-            return out;
-        }
-
-        std::vector<uint8_t> out;
-        const std::size_t iv_len = 12;
-        const std::size_t tag_len = 16;
-        out.resize(iv_len + tag_len + body.size());
-
-        uint8_t* iv = out.data();
-        uint8_t* tag = out.data() + iv_len;
-        uint8_t* ct = out.data() + iv_len + tag_len;
-
-        if (RAND_bytes(iv, static_cast<int>(iv_len)) != 1)
-        {
-            out.clear();
-            return out;
-        }
-
-        if (!aes256_gcm_encrypt_client(
-            key.data(),
-            iv,
-            iv_len,
-            body.data(),
-            body.size(),
-            ct,
-            tag))
-        {
-            out.clear();
-            return out;
-        }
-
-        flags |= FLAG_ENCRYPTED;
-        return out;
-    }
-
-    static std::span<const uint8_t> decrypt_body_if_needed_client(
-        IRpcStream& stream,
-        uint16_t flags,
-        const usub::uvent::utils::DynamicBuffer& payload,
-        std::vector<uint8_t>& tmp)
-    {
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(payload.data());
-        std::size_t sz = payload.size();
-
-        if ((flags & FLAG_ENCRYPTED) == 0)
-        {
-            return {data, sz};
-        }
-
-        if (sz < 12 + 16)
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        std::array<uint8_t, 32> key{};
-        if (!stream.get_app_secret_key(key))
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        const std::size_t iv_len = 12;
-        const std::size_t tag_len = 16;
-        const uint8_t* iv = data;
-        const uint8_t* tag = data + iv_len;
-        const uint8_t* ct = data + iv_len + tag_len;
-        std::size_t ct_len = sz - iv_len - tag_len;
-
-        tmp.resize(ct_len);
-
-        if (!aes256_gcm_decrypt_client(
-            key.data(),
-            iv,
-            iv_len,
-            ct,
-            ct_len,
-            tag,
-            tmp.data()))
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        return {tmp.data(), tmp.size()};
     }
 
     static task::Awaitable<bool> read_exact(
@@ -314,10 +90,9 @@ namespace urpc
 
     RpcClient::RpcClient(std::string host, uint16_t port)
         : RpcClient(RpcClientConfig{
-            std::move(host),
-            port,
-            nullptr
-        })
+              std::move(host),
+              port,
+              nullptr})
     {
     }
 
@@ -326,14 +101,17 @@ namespace urpc
     {
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcClient ctor host={} port={}",
+            "RpcClient ctor host={} port={} timeout_ms={} ping_interval_ms={}",
             this->config_.host,
-            this->config_.port);
+            this->config_.port,
+            this->config_.socket_timeout_ms,
+            this->config_.ping_interval_ms);
 #endif
         if (!this->config_.stream_factory)
         {
             this->config_.stream_factory =
-                std::make_shared<TcpRpcStreamFactory>(this->config_.socket_timeout_ms);
+                std::make_shared<TcpRpcStreamFactory>(
+                    this->config_.socket_timeout_ms);
         }
     }
 
@@ -356,7 +134,8 @@ namespace urpc
         if (!ok)
         {
 #if URPC_LOGS
-            usub::ulog::error("RpcClient::async_call: ensure_connected() failed");
+            usub::ulog::error(
+                "RpcClient::async_call: ensure_connected() failed");
 #endif
             co_return empty;
         }
@@ -366,29 +145,32 @@ namespace urpc
         if (sid == 0)
             sid = this->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
 
-#if URPC_LOGS
-        usub::ulog::debug(
-            "RpcClient::async_call: BEFORE register pending sid={}",
-            sid);
-#endif
-
         auto call = std::make_shared<PendingCall>();
         call->event = std::make_shared<sync::AsyncEvent>(
             sync::Reset::Manual, false);
+
         {
             auto guard = co_await this->pending_mutex_.lock();
             (void)guard;
             this->pending_calls_[sid] = call;
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call: registered PendingCall sid={} "
+                "pending_size={}",
+                sid,
+                this->pending_calls_.size());
+#endif
         }
 
         RpcFrameHeader hdr{};
-        hdr.magic = 0x55525043;
-        hdr.version = 1;
-        hdr.type = static_cast<uint8_t>(FrameType::Request);
-        hdr.flags = FLAG_END_STREAM;
+        hdr.magic     = 0x55525043;
+        hdr.version   = 1;
+        hdr.type      = static_cast<uint8_t>(FrameType::Request);
+        hdr.flags     = FLAG_END_STREAM;
         hdr.stream_id = sid;
         hdr.method_id = method_id;
-        hdr.length = static_cast<uint32_t>(request_body.size());
+        hdr.length    =
+            static_cast<uint32_t>(request_body.size());
 
         std::vector<uint8_t> enc_buf;
 
@@ -401,7 +183,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::error(
-                    "RpcClient::async_call: stream_ is null before send_frame sid={}",
+                    "RpcClient::async_call: stream_ is null before send_frame "
+                    "sid={} – removing PendingCall",
                     sid);
 #endif
                 auto g2 = co_await this->pending_mutex_.lock();
@@ -428,8 +211,7 @@ namespace urpc
                         static_cast<uint32_t>(enc_buf.size());
                     to_send = std::span<const uint8_t>{
                         enc_buf.data(),
-                        enc_buf.size()
-                    };
+                        enc_buf.size()};
 #if URPC_LOGS
                     usub::ulog::debug(
                         "RpcClient::async_call: encrypted body sid={} "
@@ -452,7 +234,8 @@ namespace urpc
 
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcClient::async_call: BEFORE send_frame sid={} len={} flags=0x{:x}",
+                "RpcClient::async_call: BEFORE send_frame sid={} len={} "
+                "flags=0x{:x}",
                 sid, hdr.length, hdr.flags);
 #endif
             bool sent = co_await send_frame(*stream, hdr, to_send);
@@ -460,7 +243,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::error(
-                    "RpcClient::async_call: send_frame failed for sid={}",
+                    "RpcClient::async_call: send_frame failed for sid={} – "
+                    "removing PendingCall",
                     sid);
 #endif
                 auto g2 = co_await this->pending_mutex_.lock();
@@ -485,7 +269,25 @@ namespace urpc
             (void)guard;
             auto it = this->pending_calls_.find(sid);
             if (it != this->pending_calls_.end())
+            {
+#if URPC_LOGS
+                usub::ulog::debug(
+                    "RpcClient::async_call: erasing PendingCall sid={} "
+                    "pending_size_before={}",
+                    sid,
+                    this->pending_calls_.size());
+#endif
                 this->pending_calls_.erase(it);
+            }
+#if URPC_LOGS
+            else
+            {
+                usub::ulog::warn(
+                    "RpcClient::async_call: PendingCall already erased for "
+                    "sid={} (by reader_loop cleanup?)",
+                    sid);
+            }
+#endif
         }
 
         if (call->error)
@@ -536,23 +338,25 @@ namespace urpc
             (void)guard;
 #if URPC_LOGS
             usub::ulog::debug(
-                "RpcClient::async_ping: register waiter sid={}", sid);
+                "RpcClient::async_ping: register waiter sid={} ping_waiters={}",
+                sid,
+                this->ping_waiters_.size() + 1);
 #endif
             this->ping_waiters_[sid] = evt;
         }
 
         RpcFrameHeader hdr{};
-        hdr.magic = 0x55525043;
+        hdr.magic   = 0x55525043;
         hdr.version = 1;
-        hdr.type = static_cast<uint8_t>(FrameType::Ping);
+        hdr.type    = static_cast<uint8_t>(FrameType::Ping);
 
         uint16_t flags = FLAG_END_STREAM |
             build_security_flags_client(this->stream_);
 
-        hdr.flags = flags;
+        hdr.flags     = flags;
         hdr.stream_id = sid;
         hdr.method_id = 0;
-        hdr.length = 0;
+        hdr.length    = 0;
 
         {
             auto guard = co_await this->write_mutex_.lock();
@@ -563,7 +367,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::error(
-                    "RpcClient::async_ping: stream_ is null before send_frame sid={}",
+                    "RpcClient::async_ping: stream_ is null before send_frame "
+                    "sid={} – removing waiter",
                     sid);
 #endif
                 auto g2 = co_await this->ping_mutex_.lock();
@@ -583,7 +388,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::error(
-                    "RpcClient::async_ping: send_frame failed sid={}",
+                    "RpcClient::async_ping: send_frame failed sid={} – "
+                    "removing waiter",
                     sid);
 #endif
                 auto g2 = co_await this->ping_mutex_.lock();
@@ -676,7 +482,8 @@ namespace urpc
         if (!this->config_.stream_factory)
         {
             this->config_.stream_factory =
-                std::make_shared<TcpRpcStreamFactory>();
+                std::make_shared<TcpRpcStreamFactory>(
+                    this->config_.socket_timeout_ms);
         }
 
         auto stream =
@@ -794,16 +601,16 @@ namespace urpc
         }
 
         uint32_t code_be = 0;
-        uint32_t len_be = 0;
+        uint32_t len_be  = 0;
 
         const auto* data =
             reinterpret_cast<const uint8_t*>(payload.data());
 
         std::memcpy(&code_be, data, 4);
-        std::memcpy(&len_be, data + 4, 4);
+        std::memcpy(&len_be,  data + 4, 4);
 
         const uint32_t code = be_to_host(code_be);
-        const uint32_t len = be_to_host(len_be);
+        const uint32_t len  = be_to_host(len_be);
 
         if (sz < 8u + len)
         {
@@ -903,7 +710,7 @@ namespace urpc
 #if URPC_LOGS
                 usub::ulog::warn(
                     "RpcClient::reader_loop: invalid header magic/ver "
-                    "(magic={} ver={})",
+                    "(magic={} ver={}) – closing connection",
                     static_cast<unsigned>(hdr.magic),
                     static_cast<unsigned>(hdr.version));
 #endif
@@ -957,7 +764,8 @@ namespace urpc
                 {
 #if URPC_LOGS
                     usub::ulog::debug(
-                        "RpcClient::reader_loop: handling Response sid={} len={} flags=0x{:x}",
+                        "RpcClient::reader_loop: handling Response sid={} len={} "
+                        "flags=0x{:x}",
                         frame.header.stream_id,
                         frame.header.length,
                         frame.header.flags);
@@ -970,17 +778,42 @@ namespace urpc
                         auto it =
                             this->pending_calls_.find(frame.header.stream_id);
                         if (it != this->pending_calls_.end())
+                        {
                             call = it->second;
+#if URPC_LOGS
+                            usub::ulog::debug(
+                                "RpcClient::reader_loop: found PendingCall "
+                                "sid={} pending_size={}",
+                                frame.header.stream_id,
+                                this->pending_calls_.size());
+#endif
+                        }
+                        else
+                        {
+#if URPC_LOGS
+                            usub::ulog::warn(
+                                "RpcClient::reader_loop: Response for unknown "
+                                "sid={} pending_size={}",
+                                frame.header.stream_id,
+                                this->pending_calls_.size());
+#endif
+                        }
                     }
 
                     if (!call)
                     {
+                        // Критическая протокольная ошибка: сервер прислал
+                        // ответ на незарегистрированный stream_id.
+                        // Рвём соединение, чтобы не оставлять висящие async_call.
 #if URPC_LOGS
-                        usub::ulog::warn(
-                            "RpcClient::reader_loop: Response for unknown sid={}",
+                        usub::ulog::error(
+                            "RpcClient::reader_loop: no PendingCall for "
+                            "sid={} -> protocol error, closing connection",
                             frame.header.stream_id);
 #endif
-                        break;
+                        this->close();  // shutdown TCP/TLS
+                        // выходим из цикла, cleanup ниже разбудит всех ожидающих
+                        goto reader_loop_exit;
                     }
 
                     const bool is_error =
@@ -1065,8 +898,8 @@ namespace urpc
                         std::string msg;
                         if (this->parse_error_payload(tmp, code, msg))
                         {
-                            call->error = true;
-                            call->error_code = code;
+                            call->error        = true;
+                            call->error_code   = code;
                             call->error_message = std::move(msg);
 #if URPC_LOGS
                             usub::ulog::warn(
@@ -1079,8 +912,8 @@ namespace urpc
                         }
                         else
                         {
-                            call->error = true;
-                            call->error_code = 0;
+                            call->error        = true;
+                            call->error_code   = 0;
                             call->error_message =
                                 "Malformed error payload";
 #if URPC_LOGS
@@ -1107,10 +940,18 @@ namespace urpc
                         call->error = false;
                         if (call->event)
                             call->event->set();
+#if URPC_LOGS
+                        usub::ulog::debug(
+                            "RpcClient::reader_loop: Response delivered "
+                            "sid={} body_size={}",
+                            frame.header.stream_id,
+                            sz);
+#endif
                     }
 
                     break;
                 }
+
             case FrameType::Ping:
                 {
 #if URPC_LOGS
@@ -1119,14 +960,14 @@ namespace urpc
                         frame.header.stream_id);
 #endif
                     RpcFrameHeader resp{};
-                    resp.magic = 0x55525043;
+                    resp.magic   = 0x55525043;
                     resp.version = 1;
-                    resp.type = static_cast<uint8_t>(FrameType::Pong);
-                    resp.flags = FLAG_END_STREAM |
+                    resp.type    = static_cast<uint8_t>(FrameType::Pong);
+                    resp.flags   = FLAG_END_STREAM |
                         build_security_flags_client(this->stream_);
                     resp.stream_id = frame.header.stream_id;
                     resp.method_id = frame.header.method_id;
-                    resp.length = 0;
+                    resp.length    = 0;
 
                     auto guard = co_await this->write_mutex_.lock();
                     (void)guard;
@@ -1187,20 +1028,27 @@ namespace urpc
             }
         }
 
+reader_loop_exit:
 #if URPC_LOGS
-        usub::ulog::warn("RpcClient::reader_loop: exiting");
+        usub::ulog::warn("RpcClient::reader_loop: exiting, running_ was={}",
+                         this->running_.load(std::memory_order_relaxed));
 #endif
         this->running_.store(false, std::memory_order_relaxed);
 
         {
             auto guard = co_await this->pending_mutex_.lock();
             (void)guard;
+#if URPC_LOGS
+            usub::ulog::warn(
+                "RpcClient::reader_loop: cleaning {} pending calls",
+                this->pending_calls_.size());
+#endif
             for (auto& call : this->pending_calls_ | std::views::values)
             {
                 if (call && call->event)
                 {
-                    call->error = true;
-                    call->error_code = 0;
+                    call->error        = true;
+                    call->error_code   = 0;
                     call->error_message = "Connection closed";
                     call->event->set();
                 }
@@ -1211,6 +1059,11 @@ namespace urpc
         {
             auto guard = co_await this->ping_mutex_.lock();
             (void)guard;
+#if URPC_LOGS
+            usub::ulog::warn(
+                "RpcClient::reader_loop: cleaning {} ping waiters",
+                this->ping_waiters_.size());
+#endif
             for (auto& evt : this->ping_waiters_ | std::views::values)
             {
                 if (evt)
@@ -1222,6 +1075,10 @@ namespace urpc
         {
             auto guard = co_await this->connect_mutex_.lock();
             (void)guard;
+#if URPC_LOGS
+            usub::ulog::info(
+                "RpcClient::reader_loop: resetting stream_");
+#endif
             this->stream_.reset();
         }
 

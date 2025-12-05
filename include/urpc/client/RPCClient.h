@@ -43,7 +43,6 @@ namespace urpc
     {
     public:
         RpcClient(std::string host, uint16_t port);
-
         explicit RpcClient(RpcClientConfig cfg);
 
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call(
@@ -107,9 +106,10 @@ namespace urpc
         static usub::uvent::task::Awaitable<void> run_reader_detached(
             std::shared_ptr<RpcClient> self);
 
-        bool parse_error_payload(const usub::uvent::utils::DynamicBuffer& payload,
-                                 uint32_t& out_code,
-                                 std::string& out_msg) const;
+        bool parse_error_payload(
+            const usub::uvent::utils::DynamicBuffer& payload,
+            uint32_t& out_code,
+            std::string& out_msg) const;
     };
 }
 

@@ -108,6 +108,10 @@ if (URPC_BUILD_EXAMPLES)
     target_link_libraries(urpc_example PRIVATE urpc)
     target_compile_definitions(urpc_example PRIVATE DEV_STAGE=${DEV_STAGE})
 
+    add_executable(urpc_example_load_imitation examples/main_load.cpp)
+    target_link_libraries(urpc_example_load_imitation PRIVATE urpc)
+    target_compile_definitions(urpc_example_load_imitation PRIVATE DEV_STAGE=${DEV_STAGE})
+
     add_executable(urpc_example_server_mtls examples/main_server_mtls.cpp)
     target_link_libraries(urpc_example_server_mtls PRIVATE urpc)
     target_compile_definitions(urpc_example_server_mtls PRIVATE DEV_STAGE=${DEV_STAGE})
