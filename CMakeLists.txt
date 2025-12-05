@@ -124,6 +124,14 @@ if (URPC_BUILD_EXAMPLES)
     target_link_libraries(urpc_example_client PRIVATE urpc)
     target_compile_definitions(urpc_example_client PRIVATE DEV_STAGE=${DEV_STAGE})
 
+    add_executable(urpc_example_client_pool examples/main_client_pool.cpp)
+    target_link_libraries(urpc_example_client_pool PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_pool PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_client_pool_expand examples/main_client_pool_expand.cpp)
+    target_link_libraries(urpc_example_client_pool_expand PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_pool_expand PRIVATE DEV_STAGE=${DEV_STAGE})
+
     add_executable(urpc_stress_client examples/main_client_stress.cpp)
     target_link_libraries(urpc_stress_client PRIVATE urpc)
     target_compile_definitions(urpc_stress_client PRIVATE DEV_STAGE=${DEV_STAGE})

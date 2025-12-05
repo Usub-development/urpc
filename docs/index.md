@@ -216,4 +216,5 @@ urpc_cli --tls \
 * [wire-format.md](wire-format.md) — Header layout, payload rules, flags
 * [transport-and-ids.md](transport-and-ids.md) — Method IDs, connection rules
 * [client.md](client.md) — Stream allocation, AES decrypt, reader loop
+* [client-pool.md](client-pool.md) — Client pool 
 * [server.md](server.md) — Accept loop, AES decrypt, handler invocation, shutdown

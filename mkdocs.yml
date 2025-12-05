@@ -53,6 +53,7 @@ nav:
   - Protocol:
       - Wire Format: wire-format.md
       - Client: client.md
+      - Client pool: client-pool.md
       - Server: server.md
       - Transport & Method IDs: transport-and-ids.md
 
