@@ -43,8 +43,17 @@ namespace urpc
                 "RpcServer: register_method_ct MethodId={}",
                 MethodId);
 #endif
-            this->registry_.register_method_ct<MethodId>(
-                std::forward<F>(f));
+            using Functor = std::decay_t<F>;
+            static Functor func = std::forward<F>(f);
+
+            auto wrapper = [](urpc::RpcContext& ctx,
+                              std::span<const std::uint8_t> body)
+                -> usub::uvent::task::Awaitable<std::vector<std::uint8_t>>
+            {
+                co_return co_await func(ctx, body);
+            };
+
+            this->register_method(MethodId, wrapper);
         }
 
         void register_method(uint64_t method_id, RpcHandlerFn fn);
