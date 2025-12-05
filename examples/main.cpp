@@ -33,7 +33,7 @@ int main()
     usub::ulog::init(cfg);
     ulog::info("SERVER: logger initialized");
 
-    urpc::RpcServerConfig config {
+    urpc::RpcServerConfig config{
         .host = "0.0.0.0",
         .port = 45900
     };
@@ -50,6 +50,15 @@ int main()
             std::vector<uint8_t> out(body.begin(), body.end());
 
             co_return out;
+        });
+
+    server.register_method_ct<urpc::method_id("Example.String")>(
+        [](urpc::RpcContext&,
+           std::span<const uint8_t> body)
+        -> usub::uvent::task::Awaitable<std::string>
+        {
+            std::string in(reinterpret_cast<const char*>(body.data()), body.size());
+            co_return "echo: " + in;
         });
 
 

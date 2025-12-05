@@ -10,6 +10,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <concepts>
+#include <vector>
 
 #include <uvent/Uvent.h>
 #include <uvent/system/SystemContext.h>
@@ -36,6 +38,11 @@ namespace urpc
         RpcMethodRegistry& registry();
 
         template <uint64_t MethodId, typename F>
+        requires std::same_as<
+            decltype(std::declval<F&>()(
+                std::declval<urpc::RpcContext&>(),
+                std::declval<std::span<const std::uint8_t>>())),
+            usub::uvent::task::Awaitable<std::vector<std::uint8_t>>>
         void register_method_ct(F&& f)
         {
 #if URPC_LOGS
@@ -51,6 +58,35 @@ namespace urpc
                 -> usub::uvent::task::Awaitable<std::vector<std::uint8_t>>
             {
                 co_return co_await func(ctx, body);
+            };
+
+            this->register_method(MethodId, wrapper);
+        }
+
+        template <uint64_t MethodId, typename F>
+        requires std::same_as<
+            decltype(std::declval<F&>()(
+                std::declval<urpc::RpcContext&>(),
+                std::declval<std::span<const std::uint8_t>>())),
+            usub::uvent::task::Awaitable<std::string>>
+        void register_method_ct(F&& f)
+        {
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcServer: register_method_ct<string> MethodId={}",
+                MethodId);
+#endif
+            using Functor = std::decay_t<F>;
+            static Functor func = std::forward<F>(f);
+
+            auto wrapper = [](urpc::RpcContext& ctx,
+                              std::span<const std::uint8_t> body)
+                -> usub::uvent::task::Awaitable<std::vector<std::uint8_t>>
+            {
+                std::string s = co_await func(ctx, body);
+                std::vector<std::uint8_t> out;
+                out.assign(s.begin(), s.end());
+                co_return out;
             };
 
             this->register_method(MethodId, wrapper);

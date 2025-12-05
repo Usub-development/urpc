@@ -5,13 +5,14 @@ This section describes how the server side of uRPC operates:
 
 It covers:
 
-- TCP / TLS / mTLS server transports
-- Accept loop
-- Per-connection RPC handling
-- Method registry
-- Cancellation
-- Response/error handling
-- Behaviour when app-level AES is enabled
+* TCP / TLS / mTLS server transports
+* Accept loop
+* Per-connection RPC handling
+* Method registry
+* **String-returning handlers**
+* Cancellation
+* Response/error handling
+* Behaviour when app-level AES is enabled
 
 ---
 
@@ -30,10 +31,10 @@ The server always receives the header unencrypted and can read all fields before
 
 `RpcServer` owns:
 
-* Listener address (host/port)
-* Worker thread count
+* Listener address
+* Thread count
 * Method registry
-* Transport factory (`IRpcStreamFactory`) — TCP, TLS, mTLS
+* Transport factory (TCP / TLS / mTLS)
 
 ```cpp
 struct RpcServerConfig {
@@ -48,75 +49,95 @@ If `stream_factory` is null, the server uses plain TCP (`TcpRpcStreamFactory`).
 
 ---
 
-## **Running the server**
+# **Registering Methods**
 
-Two entry points:
+A handler normally returns:
 
-### `Awaitable<void> RpcServer::run_async()`
+```cpp
+Awaitable<std::vector<uint8_t>>
+```
 
-Asynchronous accept loop.
+But the server also supports **returning `std::string` directly**, which is automatically re-encoded as binary payload.
 
-### `void RpcServer::run()`
+## **Binary-returning handler**
 
-* Creates `usub::Uvent` with N worker threads
-* Spawns `run_async()`
-* Calls `uvent.run()`
+```cpp
+server.register_method_ct<method_id("User.GetRaw")>(
+    [](RpcContext&, std::span<const uint8_t> body)
+        -> Awaitable<std::vector<uint8_t>>
+    {
+        co_return std::vector<uint8_t>{1,2,3,4};
+    });
+```
 
-This is the standard standalone entry point.
+## **String-returning handler**
+
+```cpp
+server.register_method_ct<method_id("Example.String")>(
+    [](RpcContext&, std::span<const uint8_t> body)
+        -> Awaitable<std::string>
+    {
+        std::string in((char*)body.data(), body.size());
+        co_return "echo: " + in;
+    });
+```
+
+The server translates it into:
+
+```
+vector<uint8_t> payload = bytes(string)
+```
+
+No additional framing or encoding is applied.
+
+This makes API development significantly simpler, especially for JSON/Glaze/YAML-based servers.
 
 ---
 
-# **Accept loop**
+# **When to use string-returning handlers**
 
-`RpcServer::accept_loop()`:
+### ✔ Good when:
 
-1. Create listening socket:
+* returning small or medium textual responses
+* producing JSON/Glaze/YAML payloads
+* you want minimal boilerplate
 
-   ```cpp
-   net::TCPServerSocket acceptor(host_.c_str(), port_);
-   ```
+### ✘ Avoid when:
 
-2. Infinite loop:
+* returning binary blobs
+* returning large serialized structures
+* you need zero allocations (use `vector<uint8_t>` directly)
 
-   ```cpp
-   while (true) {
-       auto soc = co_await acceptor.async_accept();
-   }
-   ```
+---
 
-3. On failure:
+# **Running the server**
 
-    * log
-    * sleep 50ms
-    * continue
+### Asynchronous:
 
-4. On success:
+```cpp
+Awaitable<void> RpcServer::run_async();
+```
 
-    * Wrap into transport stream:
+### Synchronous:
 
-      ```cpp
-      auto stream = stream_factory->create_server_stream(std::move(soc.value()));
-      ```
+```cpp
+void RpcServer::run();
+```
 
-      For TLS/mTLS this performs a **server-side TLS handshake**.
+Creates `Uvent` with N threads and starts the accept loop.
 
-    * Create connection:
+---
 
-      ```cpp
-      auto conn = std::make_shared<RpcConnection>(stream, registry_);
-      ```
+# **Accept Loop**
 
-    * Spawn read loop:
+Standard accept+spawn design:
 
-      ```cpp
-      system::co_spawn(RpcConnection::run_detached(conn));
-      ```
+* Accept TCP
+* Wrap in TLS (if enabled)
+* Create `RpcConnection`
+* Spawn its coroutine
 
-Each accepted connection gets:
-
-* its own `RpcConnection`
-* its own coroutine for frame reading
-* its own write mutex
+Each connection executes independently.
 
 ---
 
@@ -125,282 +146,126 @@ Each accepted connection gets:
 Maps:
 
 ```
-method_id → RpcHandlerFn*
+method_id → RpcHandlerFn
 ```
 
-Handler signature:
+Supports:
 
-```cpp
-Awaitable<std::vector<uint8_t>>(
-    RpcContext&, std::span<const uint8_t>);
-```
+* compile-time registration (`register_method_ct`)
+* runtime registration (`register_method`)
 
-API:
-
-```cpp
-void register_method(uint64_t id, RpcHandlerPtr fn);
-void register_method(std::string_view name, RpcHandlerPtr fn); // runtime hash
-RpcHandlerPtr find(uint64_t id) const;
-```
-
-Compile-time:
-
-```cpp
-template<uint64_t MethodId, typename F>
-void register_method_ct(F&& f);
-```
-
----
-
-# **RpcContext**
-
-Passed to every handler:
-
-```cpp
-struct RpcContext {
-    IRpcStream& stream;
-    uint32_t    stream_id;
-    uint64_t    method_id;
-    uint16_t    flags;
-    CancellationToken cancel_token;
-};
-```
-
-Contains:
-
-* stream metadata
-* transport flags (TLS, mTLS, ENCRYPTED)
-* cancellation token
+String-returning functors are wrapped automatically.
 
 ---
 
 # **RpcConnection**
 
-One per TCP/TLS/mTLS connection.
+Each TCP/TLS connection has exactly one RpcConnection.
 
 Responsibilities:
 
-* Read frames
-* Parse header (always plaintext)
-* Decrypt payload if `FLAG_ENCRYPTED`
-* Dispatch handler
-* Handle cancellation
-* Send responses or errors
-* Handle Ping/Pong
-
-Fields:
-
-```cpp
-std::shared_ptr<IRpcStream> stream_;
-RpcMethodRegistry& registry_;
-AsyncMutex write_mutex_;
-AsyncMutex cancel_map_mutex_;
-std::unordered_map<uint32_t,
-    std::shared_ptr<CancellationSource>> cancel_map_;
-```
-
----
-
-## **Lifecycle**
-
-Entrypoint:
-
-```cpp
-static Awaitable<void> run_detached(std::shared_ptr<RpcConnection> self);
-```
-
-Executes:
-
-```cpp
-co_await self->loop();
-```
-
-On return:
-
-* connection finishes
-* stream is closed
-
----
-
-# **Main loop**
-
-`RpcConnection::loop()`:
-
-1. Validate stream
-2. Loop:
-
-    * read **28-byte plaintext header**
-    * parse & validate
-    * read payload
-    * if `FLAG_ENCRYPTED` → decrypt AES-GCM
-    * dispatch by frame type
+* read frames
+* parse 28-byte header
+* optional AES-GCM decrypt
+* call registered handler
+* build response
+* write locked frame
+* manage cancellation
+* handle ping/pong
 
 ---
 
 # **Request Handling**
 
-```cpp
-Awaitable<void> handle_request(RpcFrame frame);
+Handler chain:
+
+```
+frame → lookup → RpcContext → functor(ctx, body) → {string|binary} → response frame
 ```
 
-Steps:
-
-1. Lookup handler
-2. If missing → send error 404
-3. Create `CancellationSource`
-4. Build `RpcContext`
-5. Call handler
-6. Remove cancel source
-7. Send success response
+If handler returns `std::string` → server converts to raw bytes.
 
 ---
 
-# **Cancel Handling**
+# **Response Encoding**
 
-A frame with:
+### Vector handler:
 
 ```
-type = Cancel
+std::vector<uint8_t> payload → raw bytes unchanged
 ```
 
-Causes:
+### String handler:
 
-* lookup cancellation source
-* if found → request cancellation
+```
+std::string s → vector<uint8_t>(s.begin(), s.end())
+```
 
-Handlers must check `ctx.cancel_token`.
+Flags always include:
+
+```
+END_STREAM
+```
+
+Unless error or cancellation.
 
 ---
 
-# **Ping Handling**
+# **Error Handling**
 
-`handle_ping(frame)` always replies with Pong:
-
-```
-type      = Pong
-flags     = END_STREAM (+ TLS/MTLS bits)
-stream_id = same
-method_id = same
-```
-
----
-
-# **Ignored types**
-
-Server ignores:
-
-* `Response`
-* `Stream` (reserved)
-* `Pong`
-* unknown
-
-Only logs them.
-
----
-
-# **Sending frames**
-
-### `locked_send(hdr, body)`
-
-Serializes writes:
-
-```cpp
-AsyncMutex lock(write_mutex_);
-send_frame(*stream_, hdr, body);
-```
-
-### `send_response(ctx, body)`
-
-Builds:
+Errors produce:
 
 ```
-type      = Response
-flags     = END_STREAM
-stream_id = ctx.stream_id
-method_id = ctx.method_id
-length    = body.size()
-```
-
-Then dispatches with `locked_send`.
-
-### `send_simple_error`
-
-Builds binary error structure:
-
-```
-u32 code
-u32 msg_len
-msg bytes
-```
-
-Sent with:
-
-```
+type  = RESPONSE
 flags = END_STREAM | ERROR
+payload = [u32 code][u32 msg_len][msg bytes]
 ```
+
+String-returning handlers can also throw — errors propagate normally.
 
 ---
 
 # **TLS / mTLS on the server**
 
-Server uses TLS if a TLS factory is supplied:
+TLS encrypts transport.
+Headers stay plaintext at uRPC layer (after TLS decrypt).
+
+mTLS populates:
 
 ```cpp
-config.stream_factory =
-    std::make_shared<TlsRpcStreamFactory>(TlsServerSettings{
-        .ca   = "ca.crt",
-        .cert = "server.crt",
-        .key  = "server.key",
-        .require_client_cert = true, // mTLS
-    });
+ctx.peer->authenticated
+ctx.peer->common_name
+ctx.peer->subject
 ```
 
-Handshake occurs inside:
-
-```
-create_server_stream(...)
-```
-
-If handshake fails → connection discarded.
-
-### Header visibility under TLS
-
-Even with TLS/mTLS:
-
-* TLS encrypts the TCP stream
-* uRPC **still receives the header as plaintext** at framing level
-  (the bytes are decrypted by TLS *before* uRPC reads them)
-
-From uRPC perspective the header is always readable and unencrypted.
+This works the same for string and binary handlers.
 
 ---
 
-# **App-level AES on the server**
+# **App-level AES (payload encryption)**
 
-If `FLAG_ENCRYPTED`:
+If enabled:
 
-* server decrypts **only the payload**
-* header stays readable
+* only payload is encrypted
+* header is not
+* symmetric AES-GCM key is derived via:
 
-AES-256-GCM key is derived from TLS exporter:
-
-```cpp
-SSL_export_keying_material(... "urpc_app_key_v1" ...)
+```
+SSL_export_keying_material("urpc_app_key_v1")
 ```
 
-Used only if both server and client enable app-level encryption.
+Server decrypts before passing to handler.
+
+String-returning handlers still work transparently.
 
 ---
 
 # **Summary**
 
-* Server handles TCP, TLS, and mTLS transports.
-* TLS/mTLS do **not** encrypt uRPC headers; only raw TCP bytes are TLS-protected.
-* App-level AES encrypts **only the payload**, never the header.
-* Each client connection has its own `RpcConnection`.
-* Requests are multiplexed by `stream_id`.
-* Cancellation is cooperative.
-* Ping/Pong built-in.
-* Method registry is hash-based.
-* Transport layer is pluggable.
-* Flow is fully coroutine-driven under uvent.
+* Server supports binary and string-returning handlers.
+* String-returning functions are auto-wrapped into binary uRPC responses.
+* Header is always plaintext at uRPC level (TLS decrypts first).
+* Payload may be AES-encrypted depending on flags.
+* Per-connection coroutine model ensures scalability.
+* Registry maps method IDs to handlers of either type.
+* uRPC server fully supports TCP, TLS, and mTLS.
