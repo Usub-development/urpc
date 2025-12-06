@@ -12,7 +12,8 @@ namespace urpc
             std::move(host),
             port,
             threads,
-            nullptr
+            nullptr,
+            0
         })
     {
     }
@@ -23,15 +24,25 @@ namespace urpc
     {
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcServer ctor host={} port={} threads={}",
+            "RpcServer ctor host={} port={} threads={} timeout_ms={}",
             this->config_.host,
             this->config_.port,
-            this->config_.threads);
+            this->config_.threads,
+            this->config_.timeout_ms);
 #endif
         if (!this->config_.stream_factory)
         {
-            this->config_.stream_factory =
-                std::make_shared<TcpRpcStreamFactory>();
+            if (this->config_.timeout_ms > 0)
+            {
+                this->config_.stream_factory =
+                    std::make_shared<TcpRpcStreamFactory>(
+                        this->config_.timeout_ms);
+            }
+            else
+            {
+                this->config_.stream_factory =
+                    std::make_shared<TcpRpcStreamFactory>();
+            }
         }
     }
 
@@ -46,7 +57,7 @@ namespace urpc
     }
 
     void RpcServer::register_method(uint64_t method_id,
-                                    RpcHandlerFn fn)
+                                    RpcHandlerPtr fn)
     {
 #if URPC_LOGS
         usub::ulog::debug(
@@ -57,7 +68,7 @@ namespace urpc
     }
 
     void RpcServer::register_method(std::string_view name,
-                                    RpcHandlerFn fn)
+                                    RpcHandlerPtr fn)
     {
 #if URPC_LOGS
         usub::ulog::debug(
@@ -71,10 +82,11 @@ namespace urpc
 #if URPC_LOGS
         usub::ulog::info(
             "RpcServer::run_async starting accept_loop "
-            "host={} port={} threads={}",
+            "host={} port={} threads={} timeout_ms={}",
             this->config_.host,
             this->config_.port,
-            this->config_.threads);
+            this->config_.threads,
+            this->config_.timeout_ms);
 #endif
         co_await this->accept_loop();
 #if URPC_LOGS
@@ -88,8 +100,9 @@ namespace urpc
     {
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcServer::run starting with threads={}",
-            this->config_.threads);
+            "RpcServer::run starting with threads={} timeout_ms={}",
+            this->config_.threads,
+            this->config_.timeout_ms);
 #endif
 
         usub::Uvent uvent(this->config_.threads);
@@ -113,8 +126,10 @@ namespace urpc
 
 #if URPC_LOGS
         usub::ulog::info(
-            "RpcServer: creating TCPServerSocket on {}:{}",
-            this->config_.host, this->config_.port);
+            "RpcServer: creating TCPServerSocket on {}:{} (timeout_ms={})",
+            this->config_.host,
+            this->config_.port,
+            this->config_.timeout_ms);
 #endif
 
         net::TCPServerSocket acceptor{
@@ -156,8 +171,23 @@ namespace urpc
 
             if (!this->config_.stream_factory)
             {
-                this->config_.stream_factory =
-                    std::make_shared<TcpRpcStreamFactory>();
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcServer: stream_factory is null in accept_loop, "
+                    "recreating with timeout_ms={}",
+                    this->config_.timeout_ms);
+#endif
+                if (this->config_.timeout_ms > 0)
+                {
+                    this->config_.stream_factory =
+                        std::make_shared<TcpRpcStreamFactory>(
+                            this->config_.timeout_ms);
+                }
+                else
+                {
+                    this->config_.stream_factory =
+                        std::make_shared<TcpRpcStreamFactory>();
+                }
             }
 
             auto stream =

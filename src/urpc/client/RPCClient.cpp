@@ -71,7 +71,8 @@ namespace urpc
         {
 #if URPC_LOGS
             usub::ulog::info(
-                "RpcClient::read_exact: EOF (r=0) -> stop reading");
+                "RpcClient::read_exact: peer closed connection "
+                "(EOF / server idle-timeout)");
 #endif
             co_return false;
         }
@@ -80,7 +81,9 @@ namespace urpc
         {
 #if URPC_LOGS
             usub::ulog::warn(
-                "RpcClient::read_exact: async_read error r={}", r);
+                "RpcClient::read_exact: async_read error r={} "
+                "(treat as connection close / timeout)",
+                r);
 #endif
             co_return false;
         }
@@ -677,7 +680,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcClient::reader_loop: header read_exact failed");
+                    "RpcClient::reader_loop: header read_exact failed "
+                    "(peer closed connection or server timeout)");
 #endif
                 break;
             }
@@ -686,7 +690,8 @@ namespace urpc
             {
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcClient::reader_loop: header size={} != {}",
+                    "RpcClient::reader_loop: header size={} != {} "
+                    "(treat as connection close)",
                     head.size(), RpcFrameHeaderSize);
 #endif
                 break;
@@ -735,7 +740,7 @@ namespace urpc
 #if URPC_LOGS
                     usub::ulog::warn(
                         "RpcClient::reader_loop: payload read_exact failed "
-                        "size={} len={}",
+                        "size={} len={} (peer close / timeout)",
                         frame.payload.size(), len);
 #endif
                     break;
@@ -1036,7 +1041,8 @@ reader_loop_exit:
             (void)guard;
 #if URPC_LOGS
             usub::ulog::warn(
-                "RpcClient::reader_loop: cleaning {} pending calls",
+                "RpcClient::reader_loop: cleaning {} pending calls "
+                "(connection closed by peer/timeout)",
                 this->pending_calls_.size());
 #endif
             for (auto& call : this->pending_calls_ | std::views::values)
@@ -1045,7 +1051,8 @@ reader_loop_exit:
                 {
                     call->error        = true;
                     call->error_code   = 0;
-                    call->error_message = "Connection closed";
+                    call->error_message =
+                        "Connection closed by peer (timeout/idle)";
                     call->event->set();
                 }
             }
@@ -1073,7 +1080,7 @@ reader_loop_exit:
             (void)guard;
 #if URPC_LOGS
             usub::ulog::info(
-                "RpcClient::reader_loop: resetting stream_");
+                "RpcClient::reader_loop: resetting stream_ after close/timeout");
 #endif
             this->stream_.reset();
         }

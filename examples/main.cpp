@@ -35,7 +35,8 @@ int main()
 
     urpc::RpcServerConfig config{
         .host = "0.0.0.0",
-        .port = 45900
+        .port = 45900,
+        .timeout_ms = 5000
     };
     urpc::RpcServer server{config};
     ulog::info("SERVER: RpcServer created");

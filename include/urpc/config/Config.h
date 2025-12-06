@@ -28,6 +28,7 @@ namespace urpc
         uint16_t port{0};
         int threads{1};
         std::shared_ptr<IRpcStreamFactory> stream_factory;
+        int timeout_ms{-1};
     };
 }
 

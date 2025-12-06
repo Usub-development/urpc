@@ -10,8 +10,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <concepts>
-#include <vector>
+#include <type_traits>
+#include <span>
 
 #include <uvent/Uvent.h>
 #include <uvent/system/SystemContext.h>
@@ -23,9 +23,25 @@
 #include <urpc/registry/RPCMethodRegistry.h>
 #include <urpc/connection/RPCConnection.h>
 #include <urpc/transport/IRPCStreamFactory.h>
+#include <urpc/context/RPCContext.h>
 
 namespace urpc
 {
+    namespace detail
+    {
+        template <class T>
+        struct awaitable_value;
+
+        template <class T>
+        struct awaitable_value<usub::uvent::task::Awaitable<T>>
+        {
+            using type = T;
+        };
+
+        template <class T>
+        using awaitable_value_t = typename awaitable_value<T>::type;
+    }
+
     class RpcServer
     {
     public:
@@ -38,11 +54,6 @@ namespace urpc
         RpcMethodRegistry& registry();
 
         template <uint64_t MethodId, typename F>
-        requires std::same_as<
-            decltype(std::declval<F&>()(
-                std::declval<urpc::RpcContext&>(),
-                std::declval<std::span<const std::uint8_t>>())),
-            usub::uvent::task::Awaitable<std::vector<std::uint8_t>>>
         void register_method_ct(F&& f)
         {
 #if URPC_LOGS
@@ -53,47 +64,41 @@ namespace urpc
             using Functor = std::decay_t<F>;
             static Functor func = std::forward<F>(f);
 
-            auto wrapper = [](urpc::RpcContext& ctx,
-                              std::span<const std::uint8_t> body)
+            using RawRet = std::invoke_result_t<
+                Functor&,
+                RpcContext&,
+                std::span<const std::uint8_t>>;
+
+            using Result = detail::awaitable_value_t<RawRet>;
+
+            auto wrapper =
+                [](urpc::RpcContext& ctx,
+                   std::span<const std::uint8_t> body)
                 -> usub::uvent::task::Awaitable<std::vector<std::uint8_t>>
             {
-                co_return co_await func(ctx, body);
+                if constexpr (std::is_same_v<Result, std::vector<std::uint8_t>>)
+                {
+                    co_return co_await func(ctx, body);
+                }
+                else if constexpr (ByteRange<Result>)
+                {
+                    Result r = co_await func(ctx, body);
+                    co_return to_byte_vector(std::move(r));
+                }
+                else
+                {
+                    static_assert(
+                        std::is_same_v<Result, void>,
+                        "RpcServer::register_method_ct: unsupported handler result type");
+                    co_return std::vector<std::uint8_t>{};
+                }
             };
 
             this->register_method(MethodId, wrapper);
         }
 
-        template <uint64_t MethodId, typename F>
-        requires std::same_as<
-            decltype(std::declval<F&>()(
-                std::declval<urpc::RpcContext&>(),
-                std::declval<std::span<const std::uint8_t>>())),
-            usub::uvent::task::Awaitable<std::string>>
-        void register_method_ct(F&& f)
-        {
-#if URPC_LOGS
-            usub::ulog::debug(
-                "RpcServer: register_method_ct<string> MethodId={}",
-                MethodId);
-#endif
-            using Functor = std::decay_t<F>;
-            static Functor func = std::forward<F>(f);
-
-            auto wrapper = [](urpc::RpcContext& ctx,
-                              std::span<const std::uint8_t> body)
-                -> usub::uvent::task::Awaitable<std::vector<std::uint8_t>>
-            {
-                std::string s = co_await func(ctx, body);
-                std::vector<std::uint8_t> out;
-                out.assign(s.begin(), s.end());
-                co_return out;
-            };
-
-            this->register_method(MethodId, wrapper);
-        }
-
-        void register_method(uint64_t method_id, RpcHandlerFn fn);
-        void register_method(std::string_view name, RpcHandlerFn fn);
+        void register_method(uint64_t method_id, RpcHandlerPtr fn);
+        void register_method(std::string_view name, RpcHandlerPtr fn);
 
         usub::uvent::task::Awaitable<void> run_async();
         void run();

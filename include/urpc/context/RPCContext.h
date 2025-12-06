@@ -7,6 +7,12 @@
 
 #include <span>
 #include <functional>
+#include <concepts>
+#include <cstdint>
+#include <cstddef>
+#include <type_traits>
+#include <vector>
+#include <cstring>
 
 #include <uvent/tasks/Awaitable.h>
 #include <uvent/sync/AsyncCancellation.h>
@@ -16,6 +22,37 @@
 
 namespace urpc
 {
+    template <class T>
+    concept ByteRange =
+        requires(const T& t)
+        {
+            { t.data() } -> std::convertible_to<const void*>;
+            { t.size() } -> std::convertible_to<std::size_t>;
+        };
+
+    template <ByteRange R>
+    inline std::vector<std::uint8_t> to_byte_vector(R&& r)
+    {
+        using T = std::remove_cvref_t<R>;
+        if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>)
+        {
+            return std::forward<R>(r);
+        }
+        else
+        {
+            const auto sz = static_cast<std::size_t>(r.size());
+            std::vector<std::uint8_t> out(sz);
+            if (sz != 0)
+            {
+                std::memcpy(
+                    out.data(),
+                    static_cast<const void*>(r.data()),
+                    sz);
+            }
+            return out;
+        }
+    }
+
     struct RpcContext
     {
         IRpcStream& stream;
