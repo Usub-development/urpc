@@ -111,7 +111,10 @@ namespace urpc
         usub::ulog::debug(
             "RpcServer::run: spawning run_async coroutine");
 #endif
-        usub::uvent::system::co_spawn(this->run_async());
+        uvent.for_each_thread([&](int threadIndex, thread::ThreadLocalStorage* tls)
+        {
+            system::co_spawn_static(this->run_async(), threadIndex);
+        });
 
         uvent.run();
 #if URPC_LOGS
