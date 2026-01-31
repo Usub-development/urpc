@@ -60,7 +60,20 @@ namespace urpc
             "RpcClient::read_exact: cur={} expected={}",
             buf.size(), expected);
 #endif
-        ssize_t r = co_await stream.async_read(buf, expected);
+        ssize_t r = 0;
+        while (buf.size() < expected)
+        {
+            const std::size_t want = expected - buf.size();
+            const ssize_t r_tmp = co_await stream.async_read(buf, want);
+
+            if (r_tmp == 0)
+                co_return false;
+
+            if (r_tmp < 0)
+                co_return false;
+
+            r += r_tmp;
+        }
 #if URPC_LOGS
         usub::ulog::debug(
             "RpcClient::read_exact: async_read r={} size={}",
