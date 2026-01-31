@@ -270,8 +270,8 @@ namespace urpc
         co_return true;
 #if URPC_LOGS
         usub::ulog::debug(
-            "RpcConnection::read_exact: async_read r={} size={}",
-            r, buf.size());
+            "RpcConnection::read_exact: size={}",
+            buf.size());
 #endif
     }
 
