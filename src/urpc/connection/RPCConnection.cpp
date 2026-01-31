@@ -262,14 +262,17 @@ namespace urpc
             buf.size(), expected);
 #endif
 
-        ssize_t r = co_await stream.async_read(buf, expected);
+        while (buf.size() < expected) {
+            const std::size_t want = expected - buf.size();
+            const ssize_t r = co_await stream.async_read(buf, want);
+            if (r <= 0) co_return false;
+        }
+        co_return true;
 #if URPC_LOGS
         usub::ulog::debug(
             "RpcConnection::read_exact: async_read r={} size={}",
             r, buf.size());
 #endif
-
-        co_return r > 0;
     }
 
     RpcConnection::RpcConnection(std::shared_ptr<IRpcStream> stream,
@@ -475,7 +478,6 @@ namespace urpc
                                std::span<const uint8_t> body)
     {
         auto guard = co_await this->write_mutex_.lock();
-        (void)guard;
 
 #if URPC_LOGS
         usub::ulog::info(
@@ -487,7 +489,9 @@ namespace urpc
             hdr.flags);
 #endif
 
-        co_await send_frame(*this->stream_, hdr, body);
+        const bool ok = co_await send_frame(*this->stream_, hdr, body);
+        if (!ok)
+            this->stream_->shutdown();
 
 #if URPC_LOGS
         usub::ulog::debug(
