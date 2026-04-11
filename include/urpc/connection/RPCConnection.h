@@ -23,14 +23,20 @@
 #include <urpc/transport/IRPCStream.h>
 #include <urpc/transport/IOOps.h>
 #include <urpc/utils/Endianness.h>
+#include <urpc/config/Config.h>
 
 namespace urpc
 {
     class RpcConnection
+        : public std::enable_shared_from_this<RpcConnection>
     {
     public:
         RpcConnection(std::shared_ptr<IRpcStream> stream,
                       RpcMethodRegistry& registry);
+
+        RpcConnection(std::shared_ptr<IRpcStream> stream,
+                      RpcMethodRegistry& registry,
+                      RpcCancelCallback on_cancel);
 
         static usub::uvent::task::Awaitable<void> run_detached(
             std::shared_ptr<RpcConnection> self);
@@ -56,9 +62,14 @@ namespace urpc
         usub::uvent::task::Awaitable<void> handle_cancel(RpcFrame frame);
         usub::uvent::task::Awaitable<void> handle_ping(RpcFrame frame);
 
+        static usub::uvent::task::Awaitable<void>
+        handle_request_detached(std::shared_ptr<RpcConnection> self,
+                                RpcFrame frame);
+
     private:
         std::shared_ptr<IRpcStream> stream_;
         RpcMethodRegistry& registry_;
+        RpcCancelCallback on_cancel_;
 
         usub::uvent::sync::AsyncMutex write_mutex_;
         usub::uvent::sync::AsyncMutex cancel_map_mutex_;

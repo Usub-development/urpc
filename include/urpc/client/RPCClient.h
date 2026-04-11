@@ -37,6 +37,17 @@ namespace urpc
         bool error{false};
         uint32_t error_code{0};
         std::string error_message;
+
+        std::atomic<bool> timed_out{false};
+    };
+
+    struct RpcCallResult
+    {
+        bool                 ok{false};
+        bool                 timed_out{false};
+        uint32_t             error_code{0};
+        std::string          error_message;
+        std::vector<uint8_t> response;
     };
 
     class RpcClient : public std::enable_shared_from_this<RpcClient>
@@ -48,6 +59,80 @@ namespace urpc
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call(
             uint64_t method_id,
             std::span<const uint8_t> request_body);
+
+        usub::uvent::task::Awaitable<std::vector<uint8_t>>
+        async_call_with_timeout(
+            uint64_t method_id,
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms);
+
+        template <size_t N>
+        usub::uvent::task::Awaitable<std::vector<uint8_t>>
+        async_call_with_timeout(
+            const char (&name)[N],
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms)
+        {
+            uint64_t mid = fnv1a64_rt(std::string_view{name, N - 1});
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call_with_timeout(name): name={} hash={} "
+                "timeout_ms={}",
+                name, mid, timeout_ms);
+#endif
+            co_return co_await this->async_call_with_timeout(
+                mid, request_body, timeout_ms);
+        }
+
+        template <uint64_t MethodId>
+        usub::uvent::task::Awaitable<std::vector<uint8_t>>
+        async_call_ct_with_timeout(
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms)
+        {
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::async_call_ct_with_timeout: MethodId={} "
+                "timeout_ms={}",
+                MethodId, timeout_ms);
+#endif
+            co_return co_await this->async_call_with_timeout(
+                MethodId, request_body, timeout_ms);
+        }
+
+        usub::uvent::task::Awaitable<RpcCallResult> try_call(
+            uint64_t method_id,
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms);
+
+        template <size_t N>
+        usub::uvent::task::Awaitable<RpcCallResult> try_call(
+            const char (&name)[N],
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms)
+        {
+            uint64_t mid = fnv1a64_rt(std::string_view{name, N - 1});
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::try_call(name): name={} hash={} timeout_ms={}",
+                name, mid, timeout_ms);
+#endif
+            co_return co_await this->try_call(mid, request_body, timeout_ms);
+        }
+
+        template <uint64_t MethodId>
+        usub::uvent::task::Awaitable<RpcCallResult> try_call_ct(
+            std::span<const uint8_t> request_body,
+            uint32_t timeout_ms)
+        {
+#if URPC_LOGS
+            usub::ulog::debug(
+                "RpcClient::try_call_ct: MethodId={} timeout_ms={}",
+                MethodId, timeout_ms);
+#endif
+            co_return co_await this->try_call(
+                MethodId, request_body, timeout_ms);
+        }
 
         template <size_t N>
         usub::uvent::task::Awaitable<std::vector<uint8_t>> async_call(
@@ -110,6 +195,16 @@ namespace urpc
             const usub::uvent::utils::DynamicBuffer& payload,
             uint32_t& out_code,
             std::string& out_msg) const;
+
+        usub::uvent::task::Awaitable<bool> send_cancel_frame(
+            uint32_t stream_id, uint64_t method_id);
+
+        static usub::uvent::task::Awaitable<void> timeout_watchdog(
+            std::shared_ptr<RpcClient> self,
+            std::shared_ptr<PendingCall> call,
+            uint32_t stream_id,
+            uint64_t method_id,
+            uint32_t timeout_ms);
     };
 }
 

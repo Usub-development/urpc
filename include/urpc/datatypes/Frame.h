@@ -14,10 +14,8 @@
 #include <urpc/utils/Systems.h>
 #include <urpc/utils/Endianness.h>
 
-namespace urpc
-{
-    enum class FrameType : uint8_t
-    {
+namespace urpc {
+    enum class FrameType : uint8_t {
         Request = 0,
         Response = 1,
         Stream = 2,
@@ -26,8 +24,7 @@ namespace urpc
         Pong = 5,
     };
 
-    enum FrameFlags : uint8_t
-    {
+    enum FrameFlags : uint8_t {
         FLAG_END_STREAM = 0x01,
         FLAG_ERROR = 0x02,
         FLAG_COMPRESSED = 0x04,
@@ -37,8 +34,7 @@ namespace urpc
         FLAG_ENCRYPTED = 0x20, // body is app-encrypted
     };
 
-    struct RpcFrameHeader
-    {
+    struct RpcFrameHeader {
         uint32_t magic; // 'URPC' = 0x55525043
         uint8_t version;
         uint8_t type;
@@ -50,31 +46,30 @@ namespace urpc
     };
 
     constexpr size_t RpcFrameHeaderSize =
-        sizeof(uint32_t) +
-        1 +
-        1 +
-        sizeof(uint16_t) +
-        sizeof(uint32_t) +
-        sizeof(uint32_t) +
-        sizeof(uint64_t) +
-        sizeof(uint32_t);
+            sizeof(uint32_t) +
+            1 +
+            1 +
+            sizeof(uint16_t) +
+            sizeof(uint32_t) +
+            sizeof(uint32_t) +
+            sizeof(uint64_t) +
+            sizeof(uint32_t);
 
-    URPC_ALWAYS_INLINE void serialize_header(const RpcFrameHeader& src, uint8_t* out)
-    {
-        auto put_be = [](uint8_t*& p, auto v)
-        {
+    constexpr std::size_t kMaxFrameBodyLength = 16u * 1024u * 1024u;
+
+    URPC_ALWAYS_INLINE void serialize_header(const RpcFrameHeader &src, uint8_t *out) {
+        auto put_be = [](uint8_t *&p, auto v) {
             using T = decltype(v);
             T be = host_to_be<T>(v);
             std::memcpy(p, &be, sizeof(T));
             p += sizeof(T);
         };
 
-        auto put8 = [](uint8_t*& p, uint8_t v)
-        {
+        auto put8 = [](uint8_t *&p, uint8_t v) {
             *p++ = v;
         };
 
-        uint8_t* p = out;
+        uint8_t *p = out;
 
         put_be(p, static_cast<uint32_t>(src.magic));
         put8(p, src.version);
@@ -86,10 +81,8 @@ namespace urpc
         put_be(p, static_cast<uint32_t>(src.length));
     }
 
-    URPC_ALWAYS_INLINE RpcFrameHeader parse_header(const uint8_t* in)
-    {
-        auto get_be = [](const uint8_t*& p, auto& out)
-        {
+    URPC_ALWAYS_INLINE RpcFrameHeader parse_header(const uint8_t *in) {
+        auto get_be = [](const uint8_t *&p, auto &out) {
             using T = std::remove_reference_t<decltype(out)>;
             T be{};
             std::memcpy(&be, p, sizeof(T));
@@ -97,13 +90,12 @@ namespace urpc
             out = be_to_host<T>(be);
         };
 
-        auto get8 = [](const uint8_t*& p, uint8_t& out)
-        {
+        auto get8 = [](const uint8_t *&p, uint8_t &out) {
             out = *p++;
         };
 
         RpcFrameHeader h{};
-        const uint8_t* p = in;
+        const uint8_t *p = in;
 
         get_be(p, h.magic);
         get8(p, h.version);
@@ -117,8 +109,7 @@ namespace urpc
         return h;
     }
 
-    struct RpcFrame
-    {
+    struct RpcFrame {
         RpcFrameHeader header;
         usub::uvent::utils::DynamicBuffer payload;
     };

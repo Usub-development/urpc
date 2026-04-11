@@ -33,9 +33,6 @@ namespace urpc
 
             net::TCPClientSocket sock;
 
-            if (timeout_ms_ > 0)
-                sock.set_timeout_ms(timeout_ms_);
-
             auto port_str = std::to_string(port);
 
             if (timeout_ms_ > 0)

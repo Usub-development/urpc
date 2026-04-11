@@ -2,9 +2,6 @@
 #include <urpc/crypto/AppCrypto.h>
 #include <urpc/transport/TlsRpcStream.h>
 
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-
 namespace urpc
 {
     using namespace usub::uvent;
@@ -17,235 +14,20 @@ namespace urpc
         return tls->app_cipher();
     }
 
-    static uint16_t build_security_flags(const RpcPeerIdentity* peer)
+    static bool stream_is_tls(IRpcStream* s)
+    {
+        return dynamic_cast<TlsRpcStream*>(s) != nullptr;
+    }
+
+    static uint16_t build_security_flags(IRpcStream* stream,
+                                         const RpcPeerIdentity* peer)
     {
         uint16_t flags = 0;
-        if (peer)
-        {
+        if (stream_is_tls(stream))
             flags |= FLAG_TLS;
-            if (peer->authenticated)
-                flags |= FLAG_MTLS;
-        }
+        if (peer && peer->authenticated)
+            flags |= FLAG_MTLS;
         return flags;
-    }
-
-    static bool aes256_gcm_encrypt(
-        const uint8_t* key,
-        const uint8_t* iv,
-        size_t iv_len,
-        const uint8_t* in,
-        size_t in_len,
-        uint8_t* out,
-        uint8_t* tag)
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-            return false;
-
-        int len = 0;
-        int out_len = 0;
-        bool ok = true;
-
-        ok = ok && (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
-        ok = ok && (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        if (in_len > 0)
-        {
-            ok = ok && (EVP_EncryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
-            out_len = len;
-        }
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_EncryptFinal_ex(ctx, out + out_len, &len) == 1);
-        out_len += len;
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1);
-        EVP_CIPHER_CTX_free(ctx);
-
-        if (!ok)
-            return false;
-
-        if (out_len != static_cast<int>(in_len))
-            return false;
-
-        return true;
-    }
-
-    static bool aes256_gcm_decrypt(
-        const uint8_t* key,
-        const uint8_t* iv,
-        size_t iv_len,
-        const uint8_t* in,
-        size_t in_len,
-        const uint8_t* tag,
-        uint8_t* out)
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx)
-            return false;
-
-        int len = 0;
-        int out_len = 0;
-        bool ok = true;
-
-        ok = ok && (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1);
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv_len), nullptr) == 1);
-        ok = ok && (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv) == 1);
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        if (in_len > 0)
-        {
-            ok = ok && (EVP_DecryptUpdate(ctx, out, &len, in, static_cast<int>(in_len)) == 1);
-            out_len = len;
-        }
-
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        ok = ok && (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) == 1);
-        if (!ok)
-        {
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
-
-        int final_rc = EVP_DecryptFinal_ex(ctx, out + out_len, &len);
-        EVP_CIPHER_CTX_free(ctx);
-
-        if (final_rc <= 0)
-            return false;
-
-        out_len += len;
-        if (out_len != static_cast<int>(in_len))
-            return false;
-
-        return true;
-    }
-
-    static std::vector<uint8_t> encrypt_body_only(
-        IRpcStream& stream,
-        uint16_t& flags,
-        std::span<const uint8_t> body)
-    {
-        if (body.empty())
-            return {};
-
-        std::array<uint8_t, 32> key{};
-        if (!stream.get_app_secret_key(key))
-        {
-            std::vector<uint8_t> out;
-            out.reserve(body.size());
-            out.insert(out.end(), body.begin(), body.end());
-            return out;
-        }
-
-        std::vector<uint8_t> out;
-        const std::size_t iv_len = 12;
-        const std::size_t tag_len = 16;
-        out.resize(iv_len + tag_len + body.size());
-
-        uint8_t* iv = out.data();
-        uint8_t* tag = out.data() + iv_len;
-        uint8_t* ct = out.data() + iv_len + tag_len;
-
-        if (RAND_bytes(iv, static_cast<int>(iv_len)) != 1)
-        {
-            out.clear();
-            return out;
-        }
-
-        if (!aes256_gcm_encrypt(
-            key.data(),
-            iv,
-            iv_len,
-            body.data(),
-            body.size(),
-            ct,
-            tag))
-        {
-            out.clear();
-            return out;
-        }
-
-        flags |= FLAG_ENCRYPTED;
-        return out;
-    }
-
-    static std::span<const uint8_t> decrypt_body_if_needed(
-        IRpcStream& stream,
-        uint16_t flags,
-        const usub::uvent::utils::DynamicBuffer& payload,
-        std::vector<uint8_t>& tmp)
-    {
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(payload.data());
-        std::size_t sz = payload.size();
-
-        if ((flags & FLAG_ENCRYPTED) == 0)
-        {
-            return {data, sz};
-        }
-
-        if (sz < 12 + 16)
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        std::array<uint8_t, 32> key{};
-        if (!stream.get_app_secret_key(key))
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        const std::size_t iv_len = 12;
-        const std::size_t tag_len = 16;
-        const uint8_t* iv = data;
-        const uint8_t* tag = data + iv_len;
-        const uint8_t* ct = data + iv_len + tag_len;
-        std::size_t ct_len = sz - iv_len - tag_len;
-
-        tmp.resize(ct_len);
-
-        if (!aes256_gcm_decrypt(
-            key.data(),
-            iv,
-            iv_len,
-            ct,
-            ct_len,
-            tag,
-            tmp.data()))
-        {
-            tmp.clear();
-            return {tmp.data(), 0};
-        }
-
-        return {tmp.data(), tmp.size()};
     }
 
     static task::Awaitable<bool> read_exact(
@@ -279,11 +61,27 @@ namespace urpc
                                  RpcMethodRegistry& registry)
         : stream_(std::move(stream))
           , registry_(registry)
+          , on_cancel_()
     {
 #if URPC_LOGS
         usub::ulog::info(
             "RpcConnection ctor: stream_={}",
             static_cast<void*>(this->stream_.get()));
+#endif
+    }
+
+    RpcConnection::RpcConnection(std::shared_ptr<IRpcStream> stream,
+                                 RpcMethodRegistry& registry,
+                                 RpcCancelCallback on_cancel)
+        : stream_(std::move(stream))
+          , registry_(registry)
+          , on_cancel_(std::move(on_cancel))
+    {
+#if URPC_LOGS
+        usub::ulog::info(
+            "RpcConnection ctor (with cancel cb): stream_={} cb_set={}",
+            static_cast<void*>(this->stream_.get()),
+            static_cast<bool>(this->on_cancel_));
 #endif
     }
 
@@ -387,6 +185,19 @@ namespace urpc
                 break;
             }
 
+            if (hdr.length > kMaxFrameBodyLength)
+            {
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcConnection::loop: frame body length {} exceeds "
+                    "kMaxFrameBodyLength {}, dropping connection",
+                    static_cast<unsigned long long>(hdr.length),
+                    static_cast<unsigned long long>(kMaxFrameBodyLength));
+#endif
+                this->stream_->shutdown();
+                break;
+            }
+
             RpcFrame frame;
             frame.header = hdr;
 
@@ -445,7 +256,10 @@ namespace urpc
                     frame.header.stream_id,
                     frame.header.method_id);
 #endif
-                co_await this->handle_request(std::move(frame));
+                usub::uvent::system::co_spawn(
+                    RpcConnection::handle_request_detached(
+                        this->shared_from_this(),
+                        std::move(frame)));
                 break;
 
             case FrameType::Cancel:
@@ -456,14 +270,29 @@ namespace urpc
                 co_await this->handle_ping(std::move(frame));
                 break;
 
-            default:
+            case FrameType::Response:
+            case FrameType::Stream:
+            case FrameType::Pong:
 #if URPC_LOGS
                 usub::ulog::warn(
-                    "RpcConnection::loop: unknown frame type={} sid={}",
+                    "RpcConnection::loop: unexpected client->server frame "
+                    "type={} sid={}, dropping connection",
                     static_cast<int>(ft),
                     frame.header.stream_id);
 #endif
-                break;
+                this->stream_->shutdown();
+                co_return;
+
+            default:
+#if URPC_LOGS
+                usub::ulog::warn(
+                    "RpcConnection::loop: unknown frame type={} sid={}, "
+                    "dropping connection",
+                    static_cast<int>(ft),
+                    frame.header.stream_id);
+#endif
+                this->stream_->shutdown();
+                co_return;
             }
         }
 
@@ -549,13 +378,15 @@ namespace urpc
             else
             {
 #if URPC_LOGS
-                usub::ulog::warn(
-                    "RpcConnection[{}]: app_encrypt_gcm failed, sending "
-                    "plaintext for mid={} sid={}",
+                usub::ulog::error(
+                    "RpcConnection[{}]: app_encrypt_gcm failed for Response "
+                    "mid={} sid={}; failing closed (no plaintext fallback)",
                     static_cast<void*>(this),
                     hdr.method_id,
                     hdr.stream_id);
 #endif
+                this->stream_->shutdown();
+                co_return;
             }
         }
 
@@ -654,14 +485,17 @@ namespace urpc
             else
             {
 #if URPC_LOGS
-                usub::ulog::warn(
-                    "RpcConnection[{}]: app_encrypt_gcm failed for ERROR, "
-                    "sending plaintext mid={} sid={} code={}",
+                usub::ulog::error(
+                    "RpcConnection[{}]: app_encrypt_gcm failed for ERROR "
+                    "mid={} sid={} code={}; failing closed (no plaintext "
+                    "fallback)",
                     static_cast<void*>(this),
                     hdr.method_id,
                     hdr.stream_id,
                     error_code);
 #endif
+                this->stream_->shutdown();
+                co_return;
             }
         }
 
@@ -677,6 +511,17 @@ namespace urpc
 #endif
 
         co_await this->locked_send(hdr, to_send);
+        co_return;
+    }
+
+    usub::uvent::task::Awaitable<void>
+    RpcConnection::handle_request_detached(
+        std::shared_ptr<RpcConnection> self,
+        RpcFrame frame)
+    {
+        if (!self)
+            co_return;
+        co_await self->handle_request(std::move(frame));
         co_return;
     }
 
@@ -718,7 +563,6 @@ namespace urpc
         auto src = std::make_shared<sync::CancellationSource>();
         {
             auto guard = co_await this->cancel_map_mutex_.lock();
-            (void)guard;
             this->cancel_map_[frame.header.stream_id] = src;
         }
 
@@ -803,6 +647,35 @@ namespace urpc
             body.size());
 #endif
 
+        if (ctx.cancel_token.stop_requested())
+        {
+#if URPC_LOGS
+            usub::ulog::info(
+                "handle_request: cancel was already requested for "
+                "sid={} mid={} before handler started; skipping handler "
+                "invocation entirely",
+                ctx.stream_id,
+                ctx.method_id);
+#endif
+            {
+                auto guard = co_await this->cancel_map_mutex_.lock();
+                this->cancel_map_.erase(frame.header.stream_id);
+            }
+
+            if (this->on_cancel_)
+            {
+                RpcCancelEvent ev{
+                    .stage                  = RpcCancelStage::BeforeHandler,
+                    .stream_id              = ctx.stream_id,
+                    .method_id              = ctx.method_id,
+                    .dropped_response_bytes = 0,
+                };
+                this->on_cancel_(ev);
+            }
+
+            co_return;
+        }
+
         std::vector<uint8_t> resp = co_await (*fn)(ctx, body);
 
 #if URPC_LOGS
@@ -815,8 +688,31 @@ namespace urpc
 
         {
             auto guard = co_await this->cancel_map_mutex_.lock();
-            (void)guard;
             this->cancel_map_.erase(frame.header.stream_id);
+        }
+
+        if (ctx.cancel_token.stop_requested())
+        {
+#if URPC_LOGS
+            usub::ulog::info(
+                "handle_request: cancel was requested for sid={} mid={} "
+                "while handler was running; dropping response "
+                "(resp_size={} bytes saved)",
+                ctx.stream_id,
+                ctx.method_id,
+                resp.size());
+#endif
+            if (this->on_cancel_)
+            {
+                RpcCancelEvent ev{
+                    .stage                  = RpcCancelStage::AfterHandler,
+                    .stream_id              = ctx.stream_id,
+                    .method_id              = ctx.method_id,
+                    .dropped_response_bytes = resp.size(),
+                };
+                this->on_cancel_(ev);
+            }
+            co_return;
         }
 
         std::span<const uint8_t> resp_span{resp.data(), resp.size()};
@@ -848,7 +744,6 @@ namespace urpc
                 src = it->second;
                 this->cancel_map_.erase(it);
             }
-            (void)guard;
         }
 
         if (src)
@@ -895,7 +790,8 @@ namespace urpc
         hdr.type = static_cast<uint8_t>(FrameType::Pong);
 
         uint16_t flags = FLAG_END_STREAM |
-            build_security_flags(this->stream_->peer_identity());
+            build_security_flags(this->stream_.get(),
+                                 this->stream_->peer_identity());
 
         hdr.flags = flags;
         hdr.stream_id = frame.header.stream_id;

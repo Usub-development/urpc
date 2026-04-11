@@ -207,7 +207,7 @@ namespace urpc
             }
 
             auto conn = std::make_shared<RpcConnection>(
-                stream, this->registry_);
+                stream, this->registry_, this->config_.on_request_cancelled);
 
 #if URPC_LOGS
             usub::ulog::info(

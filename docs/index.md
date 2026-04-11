@@ -16,6 +16,8 @@ The protocol is designed for:
 * Efficient coroutine-based processing (via **uvent**)
 * Extensibility through frame types, flags, and open versioning
 * Optional per-connection **AES-256-GCM payload encryption** on top of TLS
+* **Per-call deadlines** with client-side watchdog and server-side cancellation
+* **Observable request cancellation** on the server for metrics and cost accounting
 
 ---
 

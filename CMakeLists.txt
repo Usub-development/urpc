@@ -124,6 +124,22 @@ if (URPC_BUILD_EXAMPLES)
     target_link_libraries(urpc_example_client PRIVATE urpc)
     target_compile_definitions(urpc_example_client PRIVATE DEV_STAGE=${DEV_STAGE})
 
+    add_executable(urpc_example_client_timeout examples/main_client_timeout.cpp)
+    target_link_libraries(urpc_example_client_timeout PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_timeout PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_client_leak_check examples/main_client_leak_check.cpp)
+    target_link_libraries(urpc_example_client_leak_check PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_leak_check PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_example_client_leak_check_baseline examples/main_client_leak_check_baseline.cpp)
+    target_link_libraries(urpc_example_client_leak_check_baseline PRIVATE urpc)
+    target_compile_definitions(urpc_example_client_leak_check_baseline PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(urpc_inproc_leak_check examples/main_inproc_leak_check.cpp)
+    target_link_libraries(urpc_inproc_leak_check PRIVATE urpc)
+    target_compile_definitions(urpc_inproc_leak_check PRIVATE DEV_STAGE=${DEV_STAGE})
+
     add_executable(urpc_example_client_pool examples/main_client_pool.cpp)
     target_link_libraries(urpc_example_client_pool PRIVATE urpc)
     target_compile_definitions(urpc_example_client_pool PRIVATE DEV_STAGE=${DEV_STAGE})

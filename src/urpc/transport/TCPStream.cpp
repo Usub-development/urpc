@@ -6,11 +6,27 @@ namespace urpc
         usub::uvent::net::TCPClientSocket&& sock)
         : socket_(std::move(sock))
     {
+        const uint64_t n =
+            diag::tcp_stream_ctor_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
 #if URPC_LOGS
         usub::ulog::info(
-            "TcpRpcStream ctor: this={} fd={}",
+            "TcpRpcStream ctor #{}: this={} fd={}",
+            n,
             static_cast<void*>(this),
             this->socket_.get_raw_header()->fd);
+#endif
+    }
+
+    TcpRpcStream::~TcpRpcStream()
+    {
+        const uint64_t n =
+            diag::tcp_stream_dtor_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+#if URPC_LOGS
+        usub::ulog::info(
+            "TcpRpcStream dtor #{}: this={}",
+            n, static_cast<void*>(this));
 #endif
     }
 

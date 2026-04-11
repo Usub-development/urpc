@@ -22,6 +22,20 @@ The client always:
    derived from the TLS exporter.
 3. Passes the decrypted body to user code.
 
+### Fail-closed encryption
+
+If the client is configured with app-level AES and a frame **fails to encrypt**
+on the outbound path (for any reason — missing key, cipher context error, etc.),
+the client does **not** fall back to sending the payload in plaintext. The send
+fails, the pending call is marked as errored, and the caller observes a failed
+request. This guarantees that once encryption is negotiated, no frame will
+leave the client in clear text.
+
+The same rule applies to inbound frames: if a frame arrives with
+`FLAG_ENCRYPTED` and decryption fails, the reader loop treats it as a
+connection-level error rather than silently exposing ciphertext as a response
+body.
+
 ---
 
 # Overview
@@ -167,6 +181,117 @@ client->async_call_ct<method_id("Service.Method")>(body);
 
 ---
 
+# Per-call timeouts and cancellation
+
+In addition to the legacy `async_call` / `async_call_ct` (which wait indefinitely
+for a response), `RpcClient` exposes per-call bounded-wait APIs:
+
+```cpp
+Awaitable<RpcCallResult> try_call(
+    uint64_t method_id,
+    std::span<const uint8_t> body,
+    int timeout_ms);
+
+Awaitable<RpcCallResult> try_call(
+    std::string_view method_name,
+    std::span<const uint8_t> body,
+    int timeout_ms);
+
+template <uint64_t MID>
+Awaitable<RpcCallResult> try_call_ct(
+    std::span<const uint8_t> body,
+    int timeout_ms);
+```
+
+and a companion that returns a plain vector (error handling via empty result):
+
+```cpp
+Awaitable<std::vector<uint8_t>> async_call_with_timeout(
+    uint64_t method_id,
+    std::span<const uint8_t> body,
+    int timeout_ms);
+```
+
+Prefer `try_call` whenever you need to distinguish success from timeout from
+protocol error — it preserves the full error context.
+
+## `RpcCallResult`
+
+```cpp
+struct RpcCallResult
+{
+    bool                 ok{false};         // true iff response arrived and is non-error
+    bool                 timed_out{false};  // true iff the watchdog fired first
+    uint32_t             error_code{0};     // protocol error code, 408 on timeout
+    std::string          error_message;     // error text, "Call timed out" on timeout
+    std::vector<uint8_t> response;          // populated only when ok == true
+};
+```
+
+The flags are mutually exclusive: exactly one of `ok`, `timed_out`, or
+`error` (i.e. `!ok && !timed_out`) is true on return.
+
+## How it works
+
+`try_call` sends the Request frame immediately, then spawns a lightweight
+**watchdog** coroutine that sleeps for `timeout_ms` milliseconds and races the
+response:
+
+- **Response wins the race** — the normal path. Caller wakes, watchdog later
+  observes an empty slot in the pending map and exits as a no-op.
+- **Watchdog wins the race** — on timeout, the watchdog erases the pending
+  entry, fills in a 408 error (`"Call timed out"`), wakes the caller, and
+  sends a best-effort `Cancel` frame to the server so the server can stop
+  working on a request nobody is waiting for.
+
+Late responses that arrive **after** the watchdog has already reclaimed the
+slot are silently dropped by the reader loop. The connection stays alive and
+serves subsequent calls normally — timing out one call never tears down the
+whole connection.
+
+## Typical usage
+
+```cpp
+auto res = co_await client->try_call(
+    "OrderService.Charge",
+    request_body,
+    /*timeout_ms=*/2000);
+
+if (res.ok)
+{
+    handle_response(res.response);
+}
+else if (res.timed_out)
+{
+    ulog::warn("OrderService.Charge timed out after 2s");
+    // 408 in res.error_code, "Call timed out" in res.error_message
+}
+else
+{
+    ulog::error("OrderService.Charge failed: code={} msg={}",
+                res.error_code, res.error_message);
+}
+```
+
+## Interaction with `async_ping` and the reader loop
+
+The watchdog is per-call and does not affect ping machinery, pending calls on
+other streams, or the connection itself. A timeout on one call is strictly
+scoped to that call's `PendingCall` entry. If the server actually stops
+processing the cancelled request in response to the `Cancel` frame, that
+cancellation is observable on the server side via the
+`on_request_cancelled` callback (see `server.md`).
+
+## When to use which API
+
+| API                      | Use when                                                              |
+|--------------------------|-----------------------------------------------------------------------|
+| `async_call`             | You want the historical unbounded behaviour.                          |
+| `async_call_with_timeout`| You want a simple deadline and are OK with empty-vector = failure.    |
+| `try_call`               | You want to tell timeouts from protocol errors from server errors.    |
+
+---
+
 # Reader Loop
 
 `RpcClient::reader_loop()` runs while `running_` is `true`:
@@ -202,7 +327,12 @@ client->async_call_ct<method_id("Service.Method")>(body);
 
 * Lookup `PendingCall` by `stream_id`.
 
-* If not found → ignore (stale / unexpected).
+* If not found → **drop the frame and continue**. This is the normal case when
+  `try_call` timed out and the server's late response finally arrives — the
+  watchdog has already removed the entry from the pending map. The connection
+  remains alive and continues serving other streams. (Previously an unknown
+  stream ID was treated as a fatal protocol error and tore the connection
+  down. That behaviour was incompatible with per-call timeouts.)
 
 * If `FLAG_ERROR`:
 
@@ -335,7 +465,21 @@ mTLS requires:
 * client certificate + key
 * matching server-side mTLS setup
 
-From `RpcClient`’s perspective, TLS and mTLS are just different
+### Hostname verification
+
+When `verify_peer = true` and `server_name` is set, the client performs **both**
+SNI and strict hostname verification against the server certificate's
+SAN / CN, using `SSL_set1_host` with `X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS`.
+A server presenting a valid certificate issued for a different hostname will
+be rejected during the TLS handshake.
+
+If you set `verify_peer = true` without a `server_name`, the client still
+validates the certificate chain against the configured CA but cannot enforce
+hostname binding — a valid certificate for *any* host in the trust chain will
+pass. This is almost always a misconfiguration; set `server_name` explicitly
+for any production TLS client.
+
+From `RpcClient`'s perspective, TLS and mTLS are just different
 `IRpcStream` implementations; the high-level behaviour of `async_call`,
 `reader_loop`, `async_ping`, etc. does not change.
 

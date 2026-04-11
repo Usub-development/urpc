@@ -54,6 +54,12 @@ Total: **28 bytes**
 * Header has no padding.
 * Header is never encrypted (not by TLS, not by AES).
 * Any invalid `magic` / `version` closes the connection.
+* `length` is a 32-bit field on the wire, but implementations **enforce a
+  smaller ceiling** (`kMaxFrameBodyLength`, currently **16 MiB**) when
+  reading. A header declaring a body larger than this limit is treated as
+  a protocol error and closes the connection before any payload memory is
+  reserved. This prevents a malicious peer from triggering multi-gigabyte
+  allocations via a single header.
 
 ---
 
@@ -109,11 +115,13 @@ Payload is an error payload.
 Reserved.
 
 **FLAG_TLS**
-Underlying connection uses TLS.
+Underlying connection uses TLS (server-auth only *or* mTLS).
+Set on every frame sent over a TLS stream, regardless of whether a client
+certificate was presented.
 Header still remains plaintext.
 
 **FLAG_MTLS**
-TLS connection with verified client certificate.
+TLS connection with a verified client certificate. Implies `FLAG_TLS`.
 Header still remains plaintext.
 
 **FLAG_ENCRYPTED**
@@ -220,6 +228,10 @@ then (after AES decrypt if `FLAG_ENCRYPTED`):
 |      4 | msg_len | uint32  | 4    | BE         | UTF-8 message length   |
 |      8 | message | char[]  | N    | —          | UTF-8 text             |
 |    8+N | details | uint8[] | M    | —          | Optional data          |
+
+The parser validates that `msg_len` does not exceed the remaining payload
+size using an underflow-safe check (`msg_len > payload_size - 8`) to
+protect against crafted oversized lengths on 32-bit builds.
 
 ---
 

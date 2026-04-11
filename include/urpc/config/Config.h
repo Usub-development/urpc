@@ -5,13 +5,31 @@
 #ifndef URPC_CONFIG_H
 #define URPC_CONFIG_H
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
 namespace urpc
 {
     struct IRpcStreamFactory;
+
+    enum class RpcCancelStage : uint8_t
+    {
+        BeforeHandler = 0,
+        AfterHandler  = 1,
+    };
+
+    struct RpcCancelEvent
+    {
+        RpcCancelStage stage;
+        uint32_t       stream_id;
+        uint64_t       method_id;
+        std::size_t    dropped_response_bytes;
+    };
+
+    using RpcCancelCallback = std::function<void(const RpcCancelEvent&)>;
 
     struct RpcClientConfig
     {
@@ -29,6 +47,8 @@ namespace urpc
         int threads{1};
         std::shared_ptr<IRpcStreamFactory> stream_factory;
         int timeout_ms{-1};
+
+        RpcCancelCallback on_request_cancelled;
     };
 }
 

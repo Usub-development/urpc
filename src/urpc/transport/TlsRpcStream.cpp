@@ -276,6 +276,26 @@ namespace urpc
                 SSL_set_tlsext_host_name(
                     this->ssl_,
                     this->client_cfg_.server_name.c_str());
+
+                if (this->client_cfg_.verify_peer)
+                {
+                    SSL_set_hostflags(
+                        this->ssl_,
+                        X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                    if (SSL_set1_host(
+                        this->ssl_,
+                        this->client_cfg_.server_name.c_str()) != 1)
+                    {
+                        log_last_ssl_error("SSL_set1_host");
+                    }
+                }
+            }
+            else if (this->client_cfg_.verify_peer)
+            {
+                usub::ulog::warn(
+                    "TlsRpcStream: verify_peer=true but server_name is empty; "
+                    "hostname verification will NOT be enforced. Set "
+                    "TlsClientConfig::server_name to the expected hostname.");
             }
         }
         else
@@ -354,37 +374,7 @@ namespace urpc
 
     bool TlsRpcStream::derive_app_key()
     {
-        if (!this->ssl_)
-            return false;
-
-        const char label[] = "urpc-app-key";
-        std::array<uint8_t, 32> key{};
-
-        int rc = SSL_export_keying_material(
-            this->ssl_,
-            key.data(),
-            static_cast<size_t>(key.size()),
-            label,
-            sizeof(label) - 1,
-            nullptr,
-            0,
-            0);
-        if (rc != 1)
-        {
-            log_last_ssl_error("SSL_export_keying_material");
-            return false;
-        }
-
-        this->app_key_ = key;
-        this->has_app_key_ = true;
-
-#if URPC_LOGS
-        usub::ulog::info(
-            "TlsRpcStream::derive_app_key: key derived this={}",
-            static_cast<void*>(this));
-#endif
-
-        return true;
+        return false;
     }
 
     usub::uvent::task::Awaitable<bool> TlsRpcStream::flush_wbio()
@@ -712,9 +702,6 @@ namespace urpc
                           const TlsClientConfig& cfg)
     {
         net::TCPClientSocket sock;
-
-        if (cfg.socket_timeout_ms > 0)
-            sock.set_timeout_ms(cfg.socket_timeout_ms);
 
         auto port_str = std::to_string(port);
 

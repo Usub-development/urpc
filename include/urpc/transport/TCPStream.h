@@ -5,17 +5,27 @@
 #ifndef TCPSTREAM_H
 #define TCPSTREAM_H
 
+#include <atomic>
+
 #include <uvent/net/Socket.h>
 #include <urpc/transport/IRPCStream.h>
 #include <ulog/ulog.h>
 
 namespace urpc
 {
+    namespace diag
+    {
+        inline std::atomic<uint64_t> tcp_stream_ctor_count{0};
+        inline std::atomic<uint64_t> tcp_stream_dtor_count{0};
+    }
+
     class TcpRpcStream : public IRpcStream
     {
     public:
         explicit TcpRpcStream(
             usub::uvent::net::TCPClientSocket&& sock);
+
+        ~TcpRpcStream() override;
 
         usub::uvent::task::Awaitable<ssize_t> async_read(
             usub::uvent::utils::DynamicBuffer& buf,
@@ -30,7 +40,6 @@ namespace urpc
         [[nodiscard]] bool get_app_secret_key(
             std::array<uint8_t, 32>& out_key) const noexcept override
         {
-            (void)out_key;
             return false;
         }
 
